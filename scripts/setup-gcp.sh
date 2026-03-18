@@ -143,8 +143,8 @@ RIDER_ALLOWED_ORIGINS=https://app.ridechain.in,https://ridechain.in
 # GOOGLE_APPLICATION_CREDENTIALS=/etc/ridechain/firebase-sa.json
 
 # ── Firebase Analytics ────────────────────────────────────────────────────────
-FIREBASE_MEASUREMENT_ID=G-7W4MJWQE02
-FIREBASE_ANALYTICS_SECRET=0ZclyhQSQgironqnTxG-og
+# FIREBASE_MEASUREMENT_ID=G-XXXXXXXXXX   # Set directly on server — NEVER commit real values here
+# FIREBASE_ANALYTICS_SECRET=xxxx         # Set directly on server — NEVER commit real values here
 
 # ── HTTP API Rate Limiting ────────────────────────────────────────────────────
 BOOTSTRAP_API_RATE_LIMIT=100
