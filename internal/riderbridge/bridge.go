@@ -54,7 +54,11 @@ var upgrader = websocket.Upgrader{
 		if len(origins) == 0 {
 			return true // dev: allow all origins
 		}
-		return origins[r.Header.Get("Origin")]
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true // native mobile clients (Android/iOS) don't send Origin header
+		}
+		return origins[origin]
 	},
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
