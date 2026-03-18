@@ -1,0 +1,104 @@
+name: Build & Deploy Bootstrap
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # manual trigger from GitHub UI
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache-dependency-path: go.sum
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build linux/amd64 binary
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -ldflags="-s -w" -o bootstrap-linux-amd64 ./cmd/main.go
+          ls -lh bootstrap-linux-amd64
+          echo "### Build OK :white_check_mark:" >> $GITHUB_STEP_SUMMARY
+
+      # --- GCS backup (optional — skipped if GCP_SA_KEY_JSON secret is not set) ---
+      - name: Authenticate to Google Cloud
+        if: ${{ secrets.GCP_SA_KEY_JSON != '' }}
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
+
+      - name: Upload binary to GCS
+        if: ${{ secrets.GCP_SA_KEY_JSON != '' }}
+        run: |
+          gcloud storage cp bootstrap-linux-amd64 gs://ridechain-bootstrap-mumbai/bootstrap
+          echo "### GCS upload OK :package:" >> $GITHUB_STEP_SUMMARY
+
+      # --- SSH deploy to VM ---
+      - name: Deploy to VM via SSH
+        env:
+          SSH_KEY: ${{ secrets.GCP_VM_SSH_KEY }}
+          VM_IP: ${{ secrets.GCP_VM_IP }}
+          VM_USER: ${{ secrets.GCP_VM_USER }}
+        run: |
+          if [ -z "$SSH_KEY" ] || [ -z "$VM_IP" ] || [ -z "$VM_USER" ]; then
+            echo "::warning::SSH secrets not configured. Skipping VM deploy."
+            echo "### SSH deploy skipped (secrets not set) :warning:" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          mkdir -p ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.ssh/deploy_key"
+
+          echo "[ci] Copying binary to VM..."
+          scp $SSH_OPTS bootstrap-linux-amd64 "${VM_USER}@${VM_IP}:/tmp/bootstrap-new"
+
+          echo "[ci] Running deploy on VM..."
+          ssh $SSH_OPTS "${VM_USER}@${VM_IP}" << 'DEPLOY_SCRIPT'
+            set -e
+
+            # Detect binary path (setup script uses /opt/ridechain-bootstrap, some setups use /opt/ridechain)
+            if [ -f /opt/ridechain-bootstrap/bootstrap ]; then
+              BINARY_PATH=/opt/ridechain-bootstrap/bootstrap
+            elif [ -f /opt/ridechain/bootstrap ]; then
+              BINARY_PATH=/opt/ridechain/bootstrap
+            else
+              BINARY_PATH=/opt/ridechain-bootstrap/bootstrap
+              sudo mkdir -p /opt/ridechain-bootstrap
+            fi
+
+            echo "[deploy] Binary path: $BINARY_PATH"
+            echo "[deploy] Stopping service..."
+            sudo systemctl stop ridechain-bootstrap.service 2>/dev/null || true
+
+            echo "[deploy] Backing up old binary..."
+            sudo cp "$BINARY_PATH" "${BINARY_PATH}.bak" 2>/dev/null || true
+
+            echo "[deploy] Installing new binary..."
+            sudo mv /tmp/bootstrap-new "$BINARY_PATH"
+            sudo chmod +x "$BINARY_PATH"
+            sudo chown ridechain:ridechain "$BINARY_PATH" 2>/dev/null || true
+
+            echo "[deploy] Starting service..."
+            sudo systemctl start ridechain-bootstrap.service
+            sleep 3
+
+            echo "[deploy] Service status:"
+            sudo systemctl status ridechain-bootstrap.service --no-pager || true
+
+            echo "[deploy] Health check:"
+            curl -sf http://127.0.0.1:4005/discover 2>/dev/null && echo " OK" || echo " (may need a few more seconds)"
+            echo "[deploy] Done!"
+          DEPLOY_SCRIPT
+
+          rm -f ~/.ssh/deploy_key
+          echo "### Deployed to VM :rocket:" >> $GITHUB_STEP_SUMMARY

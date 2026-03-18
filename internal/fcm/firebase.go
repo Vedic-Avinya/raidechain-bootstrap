@@ -86,6 +86,29 @@ func (s *firebaseSender) Send(ctx context.Context, token string, data map[string
 	return nil
 }
 
+func (s *firebaseSender) SendDataOnly(ctx context.Context, token string, data map[string]string) error {
+	if token == "" {
+		return nil
+	}
+	msg := &messaging.Message{
+		Token: token,
+		Data:  data,
+		Android: &messaging.AndroidConfig{
+			Priority: "high",
+		},
+		// No Notification payload — ensures onMessageReceived is always called,
+		// even when the app is in background. The app builds its own notification
+		// (e.g. with Approve/Decline action buttons for track requests).
+	}
+	msgID, err := s.client.Send(ctx, msg)
+	if err != nil {
+		slog.Warn("fcm", "msg", "sendDataOnly failed", "token_prefix", tokenPrefix(token), "err", err)
+		return err
+	}
+	slog.Info("fcm", "msg", "sentDataOnly", "message_id", msgID, "token_prefix", tokenPrefix(token))
+	return nil
+}
+
 func tokenPrefix(t string) string {
 	if len(t) <= 12 {
 		return t

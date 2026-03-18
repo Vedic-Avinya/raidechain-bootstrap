@@ -7,16 +7,21 @@ import (
 	"strings"
 )
 
-// PushSender sends a data-only push to an FCM token (e.g. to wake the app).
+// PushSender sends a push to an FCM token (e.g. to wake the app).
 // Noop when Firebase is not configured.
 type PushSender interface {
 	Send(ctx context.Context, token string, data map[string]string) error
+	// SendDataOnly sends a data-only push (no notification payload).
+	// Use for messages where the app builds its own notification (e.g. track requests with action buttons).
+	// Data-only messages always trigger onMessageReceived even when the app is in background.
+	SendDataOnly(ctx context.Context, token string, data map[string]string) error
 }
 
 // noopSender does nothing (used when no credentials are set).
 type noopSender struct{}
 
-func (noopSender) Send(context.Context, string, map[string]string) error { return nil }
+func (noopSender) Send(context.Context, string, map[string]string) error         { return nil }
+func (noopSender) SendDataOnly(context.Context, string, map[string]string) error { return nil }
 
 // NoopSender returns a PushSender that silently discards all pushes.
 // Use as a graceful fallback when FCM credentials are unavailable.

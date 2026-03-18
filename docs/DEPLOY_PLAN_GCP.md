@@ -935,3 +935,69 @@ After deploy:
 [ ] Monitor logs for 5 minutes: journalctl -u ridechain-bootstrap -f
 [ ] Keep bootstrap.prev for 1 hour before deleting
 ```
+
+
+```
+sudo mkdir -p /etc/ridechain
+echo "BOOTSTRAP_IDENTITY_SEED=$(openssl rand -hex 32)" | sudo tee /etc/ridechain/.env
+sudo nano /etc/ridechain/.env   # then add the rest of the lines
+
+
+sudo nano /etc/ridechain/.env
+BOOTSTRAP_IDENTITY_SEED=$(openssl rand -hex 32)
+BOOTSTRAP_ENV=prod
+
+BOOTSTRAP_PORT=4001
+BOOTSTRAP_WS_PORT=4002
+BOOTSTRAP_RIDER_BRIDGE_PORT=4003
+BOOTSTRAP_DRIVER_BRIDGE_PORT=4004
+BOOTSTRAP_HTTP_PORT=4005
+
+REDIS_URL=redis://127.0.0.1:6379
+
+MAX_RIDER_CONNECTIONS=500
+RIDER_ALLOWED_ORIGINS=https://bootstrap.ridechain.in
+
+FIREBASE_MEASUREMENT_ID=G-7W4MJWQE02
+FIREBASE_ANALYTICS_SECRET=0ZclyhQSQgironqnTxG-og
+
+BOOTSTRAP_API_RATE_LIMIT=60
+BOOTSTRAP_API_BURST=10
+
+LOG_LEVEL=info
+
+
+sudo apt-get update -qq && sudo apt-get install -y git
+git clone https://github.com/Vedic-Avinya/raidechain-bootstrap.git /tmp/bootstrap
+cd /tmp/bootstrap
+
+
+export PATH=$PATH:/usr/local/go/bin
+
+git clone https://github.com/Vedic-Avinya/raidechain-bootstrap.git /tmp/bootstrap
+# (if already cloned: cd /tmp/bootstrap && git pull)
+
+# Install Go 1.24
+wget -q https://go.dev/dl/go1.24.0.linux-amd64.tar.gz -O /tmp/go.tar.gz
+sudo rm -rf /usr/local/go
+sudo tar -C /usr/local -xzf /tmp/go.tar.gz
+rm /tmp/go.tar.gz
+
+# Add to PATH (current session)
+export PATH=$PATH:/usr/local/go/bin
+
+# Verify
+go version
+
+cd /tmp/bootstrap
+GOFLAGS="-mod=mod" go build -ldflags="-s -w" -o /tmp/bootstrap-new ./cmd/main.go
+
+sudo cp /opt/ridechain/bootstrap /opt/ridechain/bootstrap.bak
+sudo mv /tmp/bootstrap-new /opt/ridechain/bootstrap
+sudo chmod +x /opt/ridechain/bootstrap
+sudo chown ridechain:ridechain /opt/ridechain/bootstrap
+sudo systemctl restart ridechain-bootstrap
+
+sudo journalctl -u ridechain-bootstrap -f
+
+```

@@ -191,14 +191,23 @@ func main() {
 	}
 	slog.Info("step", "n", 9, "msg", "redis store connected")
 
-	// HTTP API for register, search-by-name, discover (only when Redis is set).
+	// FCM sender for waking offline riders and track request pushes (optional; degrades gracefully on failure).
+	var pushSender fcm.PushSender
+	if pushSender, err = fcm.NewPushSender(ctx); err != nil {
+		slog.Warn("step", "n", 10, "msg", "FCM init failed; offline push disabled", "err", err)
+		pushSender = fcm.NoopSender()
+	}
+
+	// HTTP API for register, search-by-name, discover, and live tracking (only when Redis is set).
 	var apiSrv *api.HTTPServer
 	if store != nil {
 		apiSrv = api.NewHTTPServer(store)
 		if analyticsCli != nil {
 			apiSrv.SetAnalyticsClient(analyticsCli)
 		}
+		trackAPI := api.NewTrackAPI(store, pushSender)
 		apiMux := http.NewServeMux()
+		// Existing peer registration & discovery
 		apiMux.HandleFunc("POST /register", apiSrv.Register)
 		apiMux.HandleFunc("POST /register/", apiSrv.Register)
 		apiMux.HandleFunc("GET /search-by-name", apiSrv.SearchByName)
@@ -206,6 +215,9 @@ func main() {
 		apiMux.HandleFunc("PUT /register/fcm", apiSrv.PutFCM)
 		apiMux.HandleFunc("PUT /register/display-name", apiSrv.PutDisplayName)
 		apiMux.HandleFunc("PUT /register/lat-lng", apiSrv.PutLatLng)
+		// Live tracking session endpoints
+		apiMux.HandleFunc("POST /track/sessions", trackAPI.CreateSession)
+		apiMux.HandleFunc("/track/sessions/", trackAPI.RouteSession)
 		rl := api.NewIPRateLimiter()
 		apiServer := &http.Server{
 			Addr:              ":" + httpAPIPort,
@@ -216,7 +228,8 @@ func main() {
 			IdleTimeout:       60 * time.Second,
 		}
 		go func() {
-			slog.Info("http_api", "msg", "listening", "port", httpAPIPort, "paths", []string{"/register", "/search-by-name", "/discover"})
+			slog.Info("http_api", "msg", "listening", "port", httpAPIPort,
+				"paths", []string{"/register", "/search-by-name", "/discover", "/track/sessions"})
 			if err := apiServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				slog.Error("http_api", "msg", "server error", "err", err)
 			}
@@ -226,13 +239,6 @@ func main() {
 			defer cancel()
 			_ = apiServer.Shutdown(shutdownCtx)
 		}()
-	}
-
-	// FCM sender for waking offline riders (optional; degrades gracefully on failure).
-	var pushSender fcm.PushSender
-	if pushSender, err = fcm.NewPushSender(ctx); err != nil {
-		slog.Warn("step", "n", 10, "msg", "FCM init failed; offline push disabled", "err", err)
-		pushSender = fcm.NoopSender()
 	}
 
 	// Create bridges. Rider bridge joins per-city topics on demand (/ridechain/{city}/p2p/v1). Driver uses default topic.
