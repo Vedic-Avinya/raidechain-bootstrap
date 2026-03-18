@@ -1,0 +1,23 @@
+# Environment — NEVER commit secrets
+.env
+.env.local
+.env.*.local
+
+# Firebase / GCP service account keys — rotate immediately if committed
+*.json
+!package.json
+!package-lock.json
+
+# Build artifacts
+bootstrap
+bootstrap-*
+*.exe
+
+# Go toolchain
+vendor/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

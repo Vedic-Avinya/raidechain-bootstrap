@@ -1,0 +1,45 @@
+version: "3.8"
+
+# Run on the same GCP VM as the bootstrap node.
+# Start: docker compose up -d
+# Stop:  docker compose down
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: ridechain-prometheus
+    restart: unless-stopped
+    ports:
+      - "9091:9090"           # Prometheus UI → http://VM_IP:9091
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=30d"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"        # POST /-/reload for hot reload
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # reach bootstrap on host
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: ridechain-grafana
+    restart: unless-stopped
+    depends_on: [prometheus]
+    ports:
+      - "3000:3000"           # Grafana UI → http://VM_IP:3000
+    environment:
+      GF_SECURITY_ADMIN_USER:     admin
+      GF_SECURITY_ADMIN_PASSWORD: changeme_in_production   # CHANGE THIS
+      GF_USERS_ALLOW_SIGN_UP:     "false"
+      GF_SERVER_ROOT_URL:         "https://grafana.ridechain.in"
+      GF_FEATURE_TOGGLES_ENABLE:  publicDashboards
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro   # auto-provision datasource
+
+volumes:
+  prometheus_data:
+  grafana_data:
