@@ -146,7 +146,7 @@ func main() {
 	// GossipSub v1.1. FloodPublish removed — it sends every message to ALL peers
 	// regardless of mesh topology, causing O(N) fan-out that is catastrophic at scale.
 	slog.Info("step", "n", 8, "msg", "creating GossipSub")
-	gs, err := pubsub.NewGossipSub(ctx, h)
+	gs, err := pubsub.NewGossipSub(ctx, h, pubsub.WithMaxMessageSize(10*1024*1024))
 	if err != nil {
 		slog.Error("step", "n", 8, "msg", "failed to create GossipSub", "err", err)
 		os.Exit(1)

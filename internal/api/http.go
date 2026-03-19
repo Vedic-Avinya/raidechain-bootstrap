@@ -65,6 +65,12 @@ func (h *HTTPServer) Register(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "peerId required", http.StatusBadRequest)
 		return
 	}
+	// Reject fake Kotlin-generated peer IDs (30 chars). Real libp2p IDs are 52 chars starting with "12D3KooW".
+	if len(req.PeerID) < 46 || !strings.HasPrefix(req.PeerID, "12D3KooW") {
+		slog.Warn("register_rejected_fake_peer_id", "peer_id", req.PeerID, "len", len(req.PeerID))
+		http.Error(w, "invalid peerId: must be a real libp2p peer ID (52 chars, 12D3KooW prefix)", http.StatusBadRequest)
+		return
+	}
 	fcmToken := strings.TrimSpace(req.FCMToken)
 	if err := h.store.Register(r.Context(), req.PeerID, req.DisplayName, req.Geohash, req.Lat, req.Lng, fcmToken); err != nil {
 		slog.Error("register_failed", "peer_id", req.PeerID, "err", err)
@@ -154,8 +160,7 @@ func (h *HTTPServer) Discover(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if geohashStr == "" && (lat == nil || lng == nil) {
-		http.Error(w, "geohash or (lat,lng) required", http.StatusBadRequest)
-		return
+		slog.Info("discover_no_geo", "msg", "no lat/lng or geohash — returning fallback (up to 500 peers)")
 	}
 	locs, err := h.store.Discover(r.Context(), geohashStr, lat, lng, radiusKm)
 	if err != nil {

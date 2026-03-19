@@ -19,7 +19,8 @@ const (
 	peerTTL       = 7 * 24 * time.Hour // expire inactive peers
 	defaultRadius     = 50.0  // km
 	maxSearchResults  = 100   // cap search-by-name results
-	maxDiscoverPeers  = 200   // cap discover geo results per request
+	maxDiscoverPeers      = 100 // cap geo-filtered discover results
+	maxDiscoverNonGeo     = 500 // cap when no geo params (return all recent, ~40KB)
 )
 
 // PeerMeta is stored in Redis for each peer.
@@ -153,14 +154,20 @@ func (s *Store) SearchByName(ctx context.Context, name string) ([]string, error)
 
 // Discover returns peers within radius (km) of the given point.
 // If geohash is provided, it is decoded to lat/lng. Otherwise lat/lng must be set.
+// When neither is provided, returns up to 500 peers from India center (fallback).
 func (s *Store) Discover(ctx context.Context, geohashStr string, lat, lng *float64, radiusKm float64) ([]PeerLocation, error) {
 	var latitude, longitude float64
+	cap := maxDiscoverPeers
 	if lat != nil && lng != nil {
 		latitude, longitude = *lat, *lng
 	} else if geohashStr != "" {
 		latitude, longitude = geohash.DecodeCenter(geohashStr)
 	} else {
-		return nil, nil
+		// No geo params — return all peers using India center with earth-spanning radius.
+		// ~40KB for 500 peers (lightweight). Client should always send lat/lng but this is the fallback.
+		latitude, longitude = 20.5937, 78.9629
+		radiusKm = 20_000
+		cap = maxDiscoverNonGeo
 	}
 	if radiusKm <= 0 {
 		radiusKm = defaultRadius
@@ -169,7 +176,7 @@ func (s *Store) Discover(ctx context.Context, geohashStr string, lat, lng *float
 		Radius:   radiusKm,
 		Unit:     "km",
 		WithDist: true,
-		Count:    maxDiscoverPeers,
+		Count:    cap,
 	}).Result()
 	if err != nil {
 		return nil, err
