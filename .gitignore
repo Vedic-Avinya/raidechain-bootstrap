@@ -9,6 +9,7 @@
 !package-lock.json
 
 # Build artifacts
+main
 bootstrap
 bootstrap-*
 *.exe
@@ -16,8 +17,12 @@ bootstrap-*
 # Go toolchain
 vendor/
 
+# gomobile AAR
+p2pmobile/*.aar
+
 # Editor / OS
 .DS_Store
 .idea/
 .vscode/
+.cursor/
 *.swp

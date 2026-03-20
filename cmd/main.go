@@ -23,15 +23,19 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
+	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/ridechain/ridechain/services/bootstrap/internal/analytics"
 	"github.com/ridechain/ridechain/services/bootstrap/internal/api"
+	deviceauth "github.com/ridechain/ridechain/services/bootstrap/internal/auth"
 	"github.com/ridechain/ridechain/services/bootstrap/internal/driverbridge"
 	"github.com/ridechain/ridechain/services/bootstrap/internal/fcm"
+	"github.com/ridechain/ridechain/services/bootstrap/internal/integrity"
 	appmetrics "github.com/ridechain/ridechain/services/bootstrap/internal/metrics"
+	"github.com/ridechain/ridechain/services/bootstrap/internal/persist"
 	"github.com/ridechain/ridechain/services/bootstrap/internal/redis"
 	"github.com/ridechain/ridechain/services/bootstrap/internal/riderbridge"
 )
@@ -81,18 +85,27 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Create libp2p host with QUIC + TCP + WebSocket transports and relay.
-	slog.Info("step", "n", 3, "msg", "creating libp2p host (QUIC + TCP + WebSocket)")
+	// Create libp2p host with TCP + WebSocket transports and relay.
+	// QUIC REMOVED: quic-go v0.48.2 panics with "crypto/tls bug: where's
+	// my session ticket?" on incoming QUIC connections, causing a crash loop
+	// (restart counter hit 161+).  TCP + WS is sufficient.
+	slog.Info("step", "n", 3, "msg", "creating libp2p host (TCP + WebSocket)")
 	var h host.Host
 	h, err = libp2p.New(
 		libp2p.Identity(priv),
 		libp2p.ListenAddrStrings(
-			fmt.Sprintf("/ip4/0.0.0.0/udp/%s/quic-v1", port),
 			fmt.Sprintf("/ip4/0.0.0.0/tcp/%s", port),
 			fmt.Sprintf("/ip4/0.0.0.0/tcp/%s/ws", wsPort),
 		),
 		libp2p.EnableRelay(),
-		libp2p.EnableRelayService(),
+		libp2p.EnableRelayService(
+			relayv2.WithLimit(&relayv2.RelayLimit{
+				Duration: 5 * time.Minute,
+				Data:     20 << 20, // 20 MB — generous headroom for images after double base64
+			}),
+		),
+		libp2p.EnableHolePunching(),
+		libp2p.ForceReachabilityPublic(),
 	)
 	if err != nil {
 		slog.Error("step", "n", 3, "msg", "failed to create libp2p host", "err", err)
@@ -198,30 +211,82 @@ func main() {
 		pushSender = fcm.NoopSender()
 	}
 
+	// SQLite persistent store for permanent user records (survives Redis TTL).
+	persistDBPath := os.Getenv("PERSIST_DB_PATH")
+	if persistDBPath == "" {
+		persistDBPath = "/opt/ridechain-bootstrap/users.db"
+	}
+	persistStore, errPersist := persist.New(persistDBPath)
+	if errPersist != nil {
+		slog.Warn("persist_store_init_failed", "err", errPersist, "path", persistDBPath)
+	} else {
+		slog.Info("persist_store_ready", "path", persistDBPath)
+		defer persistStore.Close()
+	}
+
+	// Play Integrity verifier (optional; set PLAY_INTEGRITY_PACKAGE_NAME to enable).
+	// Created early so both auth handler and apiSrv can use it.
+	var integrityVerifier *integrity.Verifier
+	if pkg := os.Getenv("PLAY_INTEGRITY_PACKAGE_NAME"); pkg != "" {
+		if iv, err := integrity.NewVerifier(pkg); err != nil {
+			slog.Warn("play_integrity", "msg", "verifier init failed; integrity checks disabled", "err", err)
+		} else {
+			integrityVerifier = iv
+			slog.Info("play_integrity", "msg", "verifier enabled", "package", pkg)
+		}
+	}
+
+	// JWT auth issuer — protects all API routes except /auth/*
+	jwtSecret := os.Getenv("JWT_SECRET")
+	jwtIssuer := deviceauth.NewIssuer(jwtSecret)
+	if jwtSecret == "" {
+		slog.Warn("jwt_secret_not_set", "msg", "using random secret; tokens will NOT survive restarts — set JWT_SECRET env var")
+	}
+	slog.Info("jwt_auth", "msg", "issuer ready", "access_ttl", deviceauth.AccessTokenTTL, "refresh_ttl", deviceauth.RefreshTokenTTL)
+
 	// HTTP API for register, search-by-name, discover, and live tracking (only when Redis is set).
 	var apiSrv *api.HTTPServer
 	if store != nil {
 		apiSrv = api.NewHTTPServer(store)
+		if persistStore != nil {
+			apiSrv.SetPersistStore(persistStore)
+		}
 		if analyticsCli != nil {
 			apiSrv.SetAnalyticsClient(analyticsCli)
 		}
 		trackAPI := api.NewTrackAPI(store, pushSender)
+		authHandler := deviceauth.NewHandler(jwtIssuer, integrityVerifier)
 		apiMux := http.NewServeMux()
+		// Device auth endpoints (not protected by JWT middleware)
+		apiMux.HandleFunc("POST /auth/device", authHandler.DeviceAuth)
+		apiMux.HandleFunc("POST /auth/refresh", authHandler.RefreshAuth)
 		// Existing peer registration & discovery
 		apiMux.HandleFunc("POST /register", apiSrv.Register)
 		apiMux.HandleFunc("POST /register/", apiSrv.Register)
 		apiMux.HandleFunc("GET /search-by-name", apiSrv.SearchByName)
 		apiMux.HandleFunc("GET /discover", apiSrv.Discover)
+		apiMux.HandleFunc("POST /heartbeat", apiSrv.Heartbeat)
 		apiMux.HandleFunc("PUT /register/fcm", apiSrv.PutFCM)
 		apiMux.HandleFunc("PUT /register/display-name", apiSrv.PutDisplayName)
 		apiMux.HandleFunc("PUT /register/lat-lng", apiSrv.PutLatLng)
+		// Report user
+		apiMux.HandleFunc("POST /report", apiSrv.ReportPeer)
+		// P2P push notification fallback (when native P2P delivery fails)
+		apiMux.HandleFunc("POST /notify-peer", apiSrv.NotifyPeer)
+		// Recently active peers sorted by last activity
+		apiMux.HandleFunc("GET /peers/active", apiSrv.RecentlyActivePeers)
+		// Persistent DB: stats and peer recovery
+		apiMux.HandleFunc("GET /stats", apiSrv.Stats)
+		apiMux.HandleFunc("GET /recover-peer", apiSrv.RecoverPeer)
 		// Live tracking session endpoints
 		apiMux.HandleFunc("POST /track/sessions", trackAPI.CreateSession)
 		apiMux.HandleFunc("/track/sessions/", trackAPI.RouteSession)
 		rl := api.NewIPRateLimiter()
+		// Chain: rate limiter → JWT middleware → mux
+		jwtMiddleware := deviceauth.Middleware(jwtIssuer)
 		apiServer := &http.Server{
 			Addr:              ":" + httpAPIPort,
-			Handler:           rl.Middleware(apiMux),
+			Handler:           rl.Middleware(jwtMiddleware(apiMux)),
 			ReadHeaderTimeout: 5 * time.Second,
 			ReadTimeout:       15 * time.Second,
 			WriteTimeout:      15 * time.Second,
@@ -257,6 +322,7 @@ func main() {
 	}
 	if apiSrv != nil {
 		apiSrv.SetGeoUpdater(riderBrid)
+		apiSrv.SetPushSender(pushSender)
 	}
 
 	// When a message is targeted at a rider who is offline, try to send FCM push.

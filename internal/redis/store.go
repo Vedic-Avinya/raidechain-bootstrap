@@ -16,7 +16,7 @@ const (
 	keyPeerMeta   = "peer:meta:"       // peerId -> JSON
 	keyPeersGeo   = "peers:geo"        // GEO key for GEORADIUS
 	keySearchName = "search:name:"     // token -> set of peerIds (smart search)
-	peerTTL       = 7 * 24 * time.Hour // expire inactive peers
+	peerTTL       = 30 * 24 * time.Hour // expire inactive peers (30 days)
 	defaultRadius     = 50.0  // km
 	maxSearchResults  = 100   // cap search-by-name results
 	maxDiscoverPeers      = 100 // cap geo-filtered discover results
@@ -231,6 +231,24 @@ func (s *Store) GetPeer(ctx context.Context, peerID string) (*PeerMeta, error) {
 		return nil, err
 	}
 	return &meta, nil
+}
+
+// TouchPeer updates only UpdatedAt and refreshes TTL. Lightweight heartbeat — no name/geo re-index.
+func (s *Store) TouchPeer(ctx context.Context, peerID string) error {
+	b, err := s.client.Get(ctx, keyPeerMeta+peerID).Bytes()
+	if err == rdb.Nil {
+		return nil // peer not registered yet; ignore
+	}
+	if err != nil {
+		return err
+	}
+	var meta PeerMeta
+	if err := json.Unmarshal(b, &meta); err != nil {
+		return err
+	}
+	meta.UpdatedAt = time.Now().Unix()
+	metaJSON, _ := json.Marshal(meta)
+	return s.client.Set(ctx, keyPeerMeta+peerID, metaJSON, peerTTL).Err()
 }
 
 // SetFCMToken updates the FCM token for a peer (and refreshes TTL).
@@ -457,4 +475,28 @@ func tokenizeDisplayName(name string) []string {
 		tokens = append(tokens, word.String())
 	}
 	return tokens
+}
+
+// SaveReport stores a user report in Redis as a list entry keyed by reported peer ID.
+func (s *Store) SaveReport(ctx context.Context, reporterPeerID, reportedPeerID, reason string) error {
+	report := map[string]interface{}{
+		"reporter":  reporterPeerID,
+		"reported":  reportedPeerID,
+		"reason":    reason,
+		"timestamp": time.Now().Unix(),
+	}
+	data, err := json.Marshal(report)
+	if err != nil {
+		return err
+	}
+	key := "reports:" + reportedPeerID
+	if err := s.client.RPush(ctx, key, data).Err(); err != nil {
+		return err
+	}
+	// Keep reports for 90 days
+	s.client.Expire(ctx, key, 90*24*time.Hour)
+	// Also maintain a global reports list for admin review
+	s.client.RPush(ctx, "reports:all", data)
+	s.client.Expire(ctx, "reports:all", 90*24*time.Hour)
+	return nil
 }
