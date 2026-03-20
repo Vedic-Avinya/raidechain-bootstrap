@@ -1,0 +1,20 @@
+# Merge this into /etc/google-cloud-ops-agent/config.yaml on the GCP VM so
+# ridechain-bootstrap JSON logs appear in Cloud Logging.
+#
+# The Ops Agent uses a single YAML file — add the receivers + pipeline below
+# alongside any existing `logging:` / `metrics:` sections (do not duplicate top-level keys;
+# merge receivers under `logging.receivers` and add a new pipeline under `logging.service.pipelines`).
+#
+# Example: if you already have `logging.receivers.myapp`, add `ridechain_bootstrap` next to it,
+# and add `ridechain_to_cloud` under `logging.service.pipelines`.
+
+logging:
+  receivers:
+    ridechain_bootstrap:
+      type: systemd_journald
+      units:
+        - ridechain-bootstrap.service
+  service:
+    pipelines:
+      ridechain_to_cloud:
+        receivers: [ridechain_bootstrap]

@@ -548,6 +548,86 @@ If you only open the app, lock the phone, and wait, **no one is sending a target
 
 **To disable FCM** (e.g. local dev): set `FCM_DISABLED=true` in the env. Then bootstrap uses a noop sender and does not try ADC.
 
+**Error: `Permission 'cloudmessaging.messages.create' denied` (FCM v1 / `FcmService.SendMessage`)**
+
+**Most common mistake:** `GOOGLE_APPLICATION_CREDENTIALS` or `FIREBASE_SERVICE_ACCOUNT_JSON` is set in `/etc/ridechain-bootstrap.env` to a JSON key. Bootstrap then uses **that key’s** `client_email` for FCM — **not** the VM’s Compute Engine default service account. Granting `roles/firebasecloudmessaging.admin` only to `*-compute@developer.gserviceaccount.com` does **nothing** until you either grant the same role to **`credential_service_account`** (see bootstrap startup log) or **remove / comment out** the key env var to use true ADC on the VM.
+
+On the VM:
+
+```bash
+sudo grep -E 'GOOGLE_APPLICATION|FIREBASE_SERVICE' /etc/ridechain-bootstrap.env
+```
+
+After the next bootstrap deploy, startup logs include **`credential_service_account=...`** when a key file is used, or **`adc_service_account=...`** when using ADC.
+
+**Quick IAM probe (on the VM):** from repo `bootstrap/scripts/verify-fcm-http-v1.sh`:
+
+```bash
+chmod +x verify-fcm-http-v1.sh
+./verify-fcm-http-v1.sh ridechain-90ebd
+```
+
+- **HTTP 400** (invalid token) → OAuth identity can call FCM; IAM is fixed.  
+- **HTTP 403** → still wrong principal or missing role on **the token’s** service account.
+
+The identity calling FCM (usually the **VM’s service account** when using Application Default Credentials, or the service account in `GOOGLE_APPLICATION_CREDENTIALS` / `FIREBASE_SERVICE_ACCOUNT_JSON`) does **not** have IAM permission to send messages **on the GCP project** shown in the error (e.g. `projects/ridechain-90ebd`).
+
+**1) Confirm which service account bootstrap uses (do this first)**
+
+After restart, bootstrap logs a line like:
+
+`fcm ... adc_service_account=NNN-compute@developer.gserviceaccount.com ...`
+
+- **That email** is the principal that must have `roles/firebasecloudmessaging.admin`. If the VM uses a **custom** service account (not the default Compute SA), granting the default `*-compute@developer.gserviceaccount.com` will **not** help — grant the role to the **custom** email shown on the VM (**Compute Engine → VM instance → Details → Service account**).
+
+On the VM you can also run:
+
+```bash
+curl -s -H "Metadata-Flavor: Google" \
+  http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email
+```
+
+**2) Grant the role (replace `PROJECT_ID` and use the SA email from step 1)**
+
+```bash
+PROJECT_ID=ridechain-90ebd
+NUM=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
+DEFAULT_COMPUTE_SA="${NUM}-compute@developer.gserviceaccount.com"
+echo "Default compute SA would be: $DEFAULT_COMPUTE_SA"
+# If your VM uses the default SA:
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:${DEFAULT_COMPUTE_SA}" \
+  --role="roles/firebasecloudmessaging.admin"
+```
+
+Or **Console:** **IAM & Admin → IAM** → find **that** service account → **Edit** → **Add another role** → **Firebase Cloud Messaging Admin** (`roles/firebasecloudmessaging.admin`).
+
+**3) If you use a JSON key file**
+
+Grant the role to **`client_email`** inside the JSON (not necessarily the Compute default SA).
+
+**4) Enable APIs**
+
+```bash
+gcloud services enable fcm.googleapis.com firebase.googleapis.com --project=ridechain-90ebd
+```
+
+**5) Project ID must match the Android app**
+
+The Firebase **project_id** in `google-services.json` must match the GCP project you send from (here `ridechain-90ebd`). If you ever split projects, set on the VM: `FIREBASE_PROJECT_ID=...` (same as the app) so the server targets the correct project.
+
+**6) Reliable workaround: Firebase Admin SDK key**
+
+If IAM on the Compute SA is still painful, use the key Firebase generates:
+
+**Firebase Console → Project settings → Service accounts → Generate new private key** → place on the VM, set `GOOGLE_APPLICATION_CREDENTIALS=/path/to.json`, restart bootstrap. That service account (`firebase-adminsdk-...@...`) is intended for Admin SDK and usually already has send access for that Firebase project.
+
+**7) Wait / restart**
+
+IAM can take a short time to propagate. `sudo systemctl restart ridechain-bootstrap`.
+
+If it **still** fails after the correct SA has `roles/firebasecloudmessaging.admin`, check **“Request had insufficient authentication scopes”** below — VM OAuth scopes can block ADC even when IAM is correct (use full Cloud API access on the VM or a key file).
+
 **Error: "Request had insufficient authentication scopes"**
 
 This means the VM’s **OAuth scopes** don’t include permission to call the FCM API. IAM roles alone are not enough — the instance’s access token is limited by the scopes set when the VM was created.
