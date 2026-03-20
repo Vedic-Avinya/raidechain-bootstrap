@@ -91,6 +91,13 @@ func (h *HTTPServer) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fcmToken := strings.TrimSpace(req.FCMToken)
+	// If the client omits fcmToken (e.g. geo-only refresh), do not wipe an existing token — otherwise
+	// track_request / chat push to this peer silently fails (GetPeer returns empty FCMToken).
+	if fcmToken == "" {
+		if existing, _ := h.store.GetPeer(r.Context(), req.PeerID); existing != nil && existing.FCMToken != "" {
+			fcmToken = existing.FCMToken
+		}
+	}
 
 	// ── Registration (JWT middleware already verified device identity) ─
 	if err := h.store.Register(r.Context(), req.PeerID, req.DisplayName, req.Geohash, req.Lat, req.Lng, fcmToken); err != nil {
