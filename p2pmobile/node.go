@@ -1515,17 +1515,23 @@ func payloadLooksPreCompressed(b []byte) bool {
 	return false
 }
 
-// jsonDmPayloadSkipsZlib returns true for large UTF-8 JSON we send on DM streams (chat_msg, chat_blob_chunk, …).
-// Base64-wrapped ciphertext is expensive to zlib and often shrinks only modestly; skipping zlib cuts CPU
-// and time-to-first-byte on both peers (WiFi is rarely zlib-bound).
+// jsonDmPayloadSkipsZlib returns true for payloads that should not be zlib-compressed on DM v2.
+// - Large JSON (chat_msg, chat_blob_chunk, …): Base64 blobs are expensive to compress with little gain.
+// - Binary blob chunks (magic "RCB1", Kotlin BlobChunkBinaryWire): ciphertext is incompressible; skip zlib CPU.
 func jsonDmPayloadSkipsZlib(data []byte) bool {
 	if len(data) < compressionThreshold {
 		return false
 	}
-	if len(data) == 0 || data[0] != '{' {
+	if len(data) == 0 {
 		return false
 	}
-	return true
+	if data[0] == '{' {
+		return true
+	}
+	if len(data) >= 4 && data[0] == 'R' && data[1] == 'C' && data[2] == 'B' && data[3] == '1' {
+		return true
+	}
+	return false
 }
 
 // writeToPooledStream writes a v2 frame (flags + length + payload) with optional compression.

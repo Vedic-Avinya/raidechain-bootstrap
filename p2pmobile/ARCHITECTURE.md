@@ -7,6 +7,10 @@
 
 Incoming direct data is delivered only via **`DirectMessageHandler.OnDirectMessage`** — not duplicated through `MessageHandler` (GossipSub remains on `OnMessage` with real topic names).
 
+## Binary blob chunks (`RCB1`)
+
+Kotlin sends large file/video ciphertext with magic **`RCB1`** (see `BlobChunkBinaryWire` in `centurion-connect`). Go does not parse chunk bodies; v2 write path **skips zlib** for `RCB1` (see `jsonDmPayloadSkipsZlib` in `node.go`). Legacy JSON `chat_blob_chunk` + Base64 is still supported on receive in the app.
+
 ## Batched send (`SendBatchToPeer`)
 
 For many small payloads (e.g. encrypted blob chunks), **one JNI call** unpacks a batch and writes **N v2 frames** on the same pooled stream:
