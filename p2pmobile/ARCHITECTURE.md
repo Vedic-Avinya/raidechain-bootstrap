@@ -24,9 +24,19 @@ Limits: each frame ≤ 20 MiB; sum of lengths ≤ 24 MiB per batch (see `maxMess
 
 If a **multi-frame** write fails partway on a pooled stream, the pool is evicted and the error is returned **without** opening a new stream for the rest (avoids re-sending frames that already flushed). Callers may retry the whole batch (same trade-off as N separate sends).
 
-## Future voice / video
+## Future voice / video (WebRTC signaling)
 
-Real-time media is usually **WebRTC** (SRTP) with **libp2p used for signaling** (offer/answer/ICE), not raw DM frames. Reserve a separate protocol id (e.g. `/ridechain/signal/webrtc/1.0.0`) or a small JSON envelope over DM; keep DM for control + chat as today.
+Real-time media is usually **WebRTC** (SRTP) with **libp2p for signaling** (offer/answer/ICE). Kotlin JSON envelopes and protocol id **`/ridechain/webrtc-signal/1.0.0`** live in **`libraries/p2p-webrtc-signaling`**. You can send those payloads over DM v2 until a dedicated Go `SetStreamHandler` is added.
+
+## Group chat / MLS
+
+Group E2E is **not** implemented in `p2pmobile`. API seams: **`libraries/p2p-group-mls`** (MLS or other engine TBD).
+
+## Performance & security (mobile)
+
+- **Compression:** Payloads above ~2.5 KB may use zlib unless magic bytes look like JPEG/PNG/WebP/GIF/Ogg (less CPU on media).
+- **DoS:** Per-peer inbound limits on DM streams (`ingress.go`): bytes/sec + frames/sec token buckets; excess → stream reset. Lines with **`SECURITY`** still print when verbose is off.
+- **Logging:** **`SetVerboseLogging(false)`** (JNI) silences `p2p_transport:` and most `p2pmobile:` diagnostics; release builds should set **`CenturionConfig.verboseNativeP2PLogging = false`** (rider uses `BuildConfig.DEBUG`).
 
 ## Build
 

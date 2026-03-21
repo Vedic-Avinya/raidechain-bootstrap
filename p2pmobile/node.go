@@ -50,20 +50,14 @@ const (
 	OptimizedDMProtocol = "/ridechain/dm/2.0.0"
 	maxMessageSize      = 20 * 1024 * 1024 // 20 MB
 	identityKeyFile     = "p2p_identity.key"
-	// compressionThreshold: payloads above this size get zlib-compressed.
-	compressionThreshold = 1024 // 1 KB
+	// compressionThreshold: payloads above this size may be zlib-compressed (skipped if already JPEG/PNG/WebP/etc.).
+	compressionThreshold = 2560
 	// streamPoolTTL: how long an idle pooled stream stays alive.
 	streamPoolTTL = 60 * time.Second
 	// Direct batch (JNI): packed format [4B BE count][4B BE len][payload]×N — one Go entry, many v2 frames.
 	maxBatchFrames     = 512
 	maxBatchTotalBytes = 24 * 1024 * 1024 // cap total plaintext per batch (below sum of maxMessageSize)
 )
-
-// logP2pTransport prefixes lines with "p2p_transport:" so logcat matches Android
-// CenturionConnectImpl (adb logcat | grep p2p_transport).
-func logP2pTransport(format string, args ...interface{}) {
-	fmt.Printf("p2p_transport: "+format+"\n", args...)
-}
 
 // -------- Callback interfaces (gomobile-compatible: simple types only) --------
 
@@ -116,6 +110,9 @@ type Node struct {
 	// Key: peer.ID string, Value: *pooledStream
 	streamPoolMu sync.Mutex
 	streamPool   map[string]*pooledStream
+
+	ingressMu     sync.Mutex
+	ingressBudget map[string]*peerIngressBudget
 }
 
 // pooledStream wraps a reusable libp2p stream with a buffered writer.
@@ -1142,7 +1139,7 @@ func (n *Node) sendDirectFrames(targetPeerID string, frames [][]byte) error {
 	if negotiated == OptimizedDMProtocol {
 		ps := &pooledStream{
 			stream:  s,
-			writer:  bufio.NewWriterSize(s, 64*1024),
+			writer:  bufio.NewWriterSize(s, 256*1024),
 			lastUse: time.Now(),
 		}
 		n.putPooledStream(targetPeerID, ps)
@@ -1368,27 +1365,33 @@ func (n *Node) handleDirectStream(s network.Stream) {
 	if strings.Contains(remoteAddr, "p2p-circuit") {
 		connType = "RELAY"
 	}
-	fmt.Printf("p2pmobile: incoming direct stream from %s type=%s addr=%s (dir=%s)\n",
+	p2pDebugf("p2pmobile: incoming direct stream from %s type=%s addr=%s (dir=%s)\n",
 		fromShort, connType, remoteAddr, s.Conn().Stat().Direction)
 	logP2pTransport("incoming PATH=LIBP2P_STREAM_V1 open from=%s… conn=%s dir=%v addr=%s",
 		fromShort, connType, s.Conn().Stat().Direction, remoteAddr)
 
 	hdr := make([]byte, 4)
 	if _, err := io.ReadFull(s, hdr); err != nil {
-		fmt.Printf("p2pmobile: direct stream header read error from %s: %v\n", from, err)
+		p2pDebugf("p2pmobile: direct stream header read error from %s: %v\n", from, err)
 		return
 	}
 	length := uint32(hdr[0])<<24 | uint32(hdr[1])<<16 | uint32(hdr[2])<<8 | uint32(hdr[3])
 	if length > maxMessageSize {
-		fmt.Printf("p2pmobile: direct stream message too large from %s: %d bytes\n", from, length)
+		p2pDebugf("p2pmobile: direct stream message too large from %s: %d bytes\n", from, length)
+		return
+	}
+	rpid := s.Conn().RemotePeer()
+	if !n.allowIncomingDM(rpid, int(length)) {
+		fmt.Printf("p2pmobile: SECURITY dm v1 ingress rate limit peer=%s len=%d\n", fromShort, length)
+		s.Reset()
 		return
 	}
 	data := make([]byte, length)
 	if _, err := io.ReadFull(s, data); err != nil {
-		fmt.Printf("p2pmobile: direct stream body read error from %s: %v\n", from, err)
+		p2pDebugf("p2pmobile: direct stream body read error from %s: %v\n", from, err)
 		return
 	}
-	fmt.Printf("p2pmobile: direct stream received %d bytes from %s\n", length, from)
+	p2pDebugf("p2pmobile: direct stream received %d bytes from %s\n", length, from)
 	logP2pTransport("incoming PATH=LIBP2P_STREAM_V1 from=%s… bytes=%d conn=%s (unicast stream, not GossipSub)",
 		fromShort, length, connType)
 
@@ -1488,6 +1491,43 @@ func (n *Node) streamPoolJanitor() {
 	}
 }
 
+// payloadLooksPreCompressed skips zlib for common media/container magic (saves CPU/battery).
+func payloadLooksPreCompressed(b []byte) bool {
+	if len(b) < 12 {
+		return false
+	}
+	if b[0] == 0xff && b[1] == 0xd8 {
+		return true // JPEG
+	}
+	if len(b) >= 8 && b[0] == 0x89 && b[1] == 'P' && b[2] == 'N' && b[3] == 'G' {
+		return true
+	}
+	if len(b) >= 12 && b[0] == 'R' && b[1] == 'I' && b[2] == 'F' && b[3] == 'F' &&
+		b[8] == 'W' && b[9] == 'E' && b[10] == 'B' && b[11] == 'P' {
+		return true
+	}
+	if len(b) >= 6 && b[0] == 'G' && b[1] == 'I' && b[2] == 'F' {
+		return true
+	}
+	if len(b) >= 4 && b[0] == 'O' && b[1] == 'g' && b[2] == 'g' && b[3] == 'S' {
+		return true // Ogg (e.g. Opus)
+	}
+	return false
+}
+
+// jsonDmPayloadSkipsZlib returns true for large UTF-8 JSON we send on DM streams (chat_msg, chat_blob_chunk, …).
+// Base64-wrapped ciphertext is expensive to zlib and often shrinks only modestly; skipping zlib cuts CPU
+// and time-to-first-byte on both peers (WiFi is rarely zlib-bound).
+func jsonDmPayloadSkipsZlib(data []byte) bool {
+	if len(data) < compressionThreshold {
+		return false
+	}
+	if len(data) == 0 || data[0] != '{' {
+		return false
+	}
+	return true
+}
+
 // writeToPooledStream writes a v2 frame (flags + length + payload) with optional compression.
 // Single buffered Flush = single TCP segment for small messages (text, acks).
 func (n *Node) writeToPooledStream(ps *pooledStream, data []byte) error {
@@ -1498,8 +1538,8 @@ func (n *Node) writeToPooledStream(ps *pooledStream, data []byte) error {
 	var payload []byte
 	var flags byte = 0x00
 
-	// Compress payloads above threshold (images, voice notes benefit hugely)
-	if len(data) > compressionThreshold {
+	// Compress payloads above threshold unless already compressed media (saves CPU on images).
+	if len(data) > compressionThreshold && !payloadLooksPreCompressed(data) && !jsonDmPayloadSkipsZlib(data) {
 		var buf bytes.Buffer
 		w := zlib.NewWriter(&buf)
 		w.Write(data)
@@ -1509,7 +1549,7 @@ func (n *Node) writeToPooledStream(ps *pooledStream, data []byte) error {
 		if len(compressed) < len(data)-64 {
 			payload = compressed
 			flags = 0x01
-			fmt.Printf("p2pmobile: [compress] %d → %d bytes (%.0f%% reduction)\n",
+			p2pDebugf("p2pmobile: [compress] %d → %d bytes (%.0f%% reduction)\n",
 				len(data), len(compressed), 100*(1-float64(len(compressed))/float64(len(data))))
 		} else {
 			payload = data
@@ -1535,7 +1575,8 @@ func (n *Node) writeToPooledStream(ps *pooledStream, data []byte) error {
 
 func (n *Node) handleOptimizedStream(s network.Stream) {
 	// v2 streams are persistent — do NOT close on return. Read in a loop.
-	from := s.Conn().RemotePeer().String()
+	rpid := s.Conn().RemotePeer()
+	from := rpid.String()
 	fromShort := from
 	if len(fromShort) > 16 {
 		fromShort = fromShort[:16]
@@ -1545,33 +1586,39 @@ func (n *Node) handleOptimizedStream(s network.Stream) {
 	if strings.Contains(remoteAddr, "p2p-circuit") {
 		connType = "RELAY"
 	}
-	fmt.Printf("p2pmobile: incoming v2 stream from %s type=%s addr=%s\n", fromShort, connType, remoteAddr)
+	p2pDebugf("p2pmobile: incoming v2 stream from %s type=%s addr=%s\n", fromShort, connType, remoteAddr)
 	logP2pTransport("incoming PATH=LIBP2P_STREAM_V2 open from=%s… conn=%s addr=%s (persistent dm/2.0.0)",
 		fromShort, connType, remoteAddr)
 
 	reader := bufio.NewReaderSize(s, 64*1024)
+	malformed := 0
 	for {
 		// Read frame: [flags:1] [length:4] [payload]
 		flagsByte, err := reader.ReadByte()
 		if err != nil {
 			if err != io.EOF {
-				fmt.Printf("p2pmobile: v2 stream closed from %s: %v\n", fromShort, err)
+				p2pDebugf("p2pmobile: v2 stream closed from %s: %v\n", fromShort, err)
 			}
 			return
 		}
 		hdr := make([]byte, 4)
 		if _, err := io.ReadFull(reader, hdr); err != nil {
-			fmt.Printf("p2pmobile: v2 length read error from %s: %v\n", fromShort, err)
+			p2pDebugf("p2pmobile: v2 length read error from %s: %v\n", fromShort, err)
 			return
 		}
 		length := uint32(hdr[0])<<24 | uint32(hdr[1])<<16 | uint32(hdr[2])<<8 | uint32(hdr[3])
 		if length > maxMessageSize {
-			fmt.Printf("p2pmobile: v2 message too large from %s: %d bytes\n", fromShort, length)
+			p2pDebugf("p2pmobile: v2 message too large from %s: %d bytes\n", fromShort, length)
+			return
+		}
+		if !n.allowIncomingDM(rpid, int(length)) {
+			fmt.Printf("p2pmobile: SECURITY dm v2 ingress rate limit peer=%s len=%d\n", fromShort, length)
+			s.Reset()
 			return
 		}
 		payload := make([]byte, length)
 		if _, err := io.ReadFull(reader, payload); err != nil {
-			fmt.Printf("p2pmobile: v2 body read error from %s: %v\n", fromShort, err)
+			p2pDebugf("p2pmobile: v2 body read error from %s: %v\n", fromShort, err)
 			return
 		}
 
@@ -1580,20 +1627,32 @@ func (n *Node) handleOptimizedStream(s network.Stream) {
 		if flagsByte&0x01 != 0 {
 			r, err := zlib.NewReader(bytes.NewReader(payload))
 			if err != nil {
-				fmt.Printf("p2pmobile: v2 zlib init error from %s: %v\n", fromShort, err)
+				malformed++
+				p2pDebugf("p2pmobile: v2 zlib init error from %s: %v\n", fromShort, err)
+				if malformed >= dmMaxMalformedFrames {
+					fmt.Printf("p2pmobile: SECURITY dm v2 too many malformed frames peer=%s\n", fromShort)
+					s.Reset()
+					return
+				}
 				continue
 			}
-			decompressed, err := io.ReadAll(r)
+			decompressed, err := io.ReadAll(io.LimitReader(r, maxMessageSize+1))
 			r.Close()
-			if err != nil {
-				fmt.Printf("p2pmobile: v2 zlib read error from %s: %v\n", fromShort, err)
+			if err != nil || len(decompressed) > maxMessageSize {
+				malformed++
+				p2pDebugf("p2pmobile: v2 zlib read error from %s: %v\n", fromShort, err)
+				if malformed >= dmMaxMalformedFrames {
+					fmt.Printf("p2pmobile: SECURITY dm v2 too many bad decompress peer=%s\n", fromShort)
+					s.Reset()
+					return
+				}
 				continue
 			}
 			data = decompressed
-			fmt.Printf("p2pmobile: [decompress] %d → %d bytes from %s\n", len(payload), len(data), fromShort)
+			p2pDebugf("p2pmobile: [decompress] %d → %d bytes from %s\n", len(payload), len(data), fromShort)
 		}
 
-		fmt.Printf("p2pmobile: v2 received %d bytes from %s\n", len(data), fromShort)
+		p2pDebugf("p2pmobile: v2 received %d bytes from %s\n", len(data), fromShort)
 		logP2pTransport("incoming PATH=LIBP2P_STREAM_V2 from=%s… bytes=%d conn=%s (unicast v2 frame)",
 			fromShort, len(data), connType)
 		if h := n.directHandler; h != nil {
@@ -1618,7 +1677,7 @@ func (n *Node) OnNetworkChanged() {
 	if !running || h == nil {
 		return
 	}
-	fmt.Println("p2pmobile: ⚡ OnNetworkChanged — refreshing addresses and connections")
+	p2pDebugf("p2pmobile: ⚡ OnNetworkChanged — refreshing addresses and connections\n")
 
 	// 1. Clear ALL stale extra addresses (old WiFi/cellular IPs are now dead)
 	n.extraAddrsMu.Lock()
@@ -1635,7 +1694,8 @@ func (n *Node) OnNetworkChanged() {
 		delete(n.streamPool, pid)
 	}
 	n.streamPoolMu.Unlock()
-	fmt.Printf("p2pmobile: [netchange] evicted %d pooled streams\n", poolCount)
+	p2pDebugf("p2pmobile: [netchange] evicted %d pooled streams\n", poolCount)
+	n.clearIngressBudgets()
 
 	// 3. Close stale connections to non-bootstrap peers (their addrs are now wrong for us)
 	for _, p := range h.Network().Peers() {
