@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -53,7 +54,16 @@ const (
 	compressionThreshold = 1024 // 1 KB
 	// streamPoolTTL: how long an idle pooled stream stays alive.
 	streamPoolTTL = 60 * time.Second
+	// Direct batch (JNI): packed format [4B BE count][4B BE len][payload]×N — one Go entry, many v2 frames.
+	maxBatchFrames     = 512
+	maxBatchTotalBytes = 24 * 1024 * 1024 // cap total plaintext per batch (below sum of maxMessageSize)
 )
+
+// logP2pTransport prefixes lines with "p2p_transport:" so logcat matches Android
+// CenturionConnectImpl (adb logcat | grep p2p_transport).
+func logP2pTransport(format string, args ...interface{}) {
+	fmt.Printf("p2p_transport: "+format+"\n", args...)
+}
 
 // -------- Callback interfaces (gomobile-compatible: simple types only) --------
 
@@ -878,7 +888,12 @@ func (n *Node) Publish(topicName string, data []byte) error {
 		n.topics[topicName] = topic
 	}
 	n.mu.Unlock()
-	return topic.Publish(n.ctx, data)
+	if err := topic.Publish(n.ctx, data); err != nil {
+		return err
+	}
+	logP2pTransport("Publish PATH=GOSSIPSUB_TOPIC topic=%s bytes=%d — mesh broadcast; peers may receive duplicates",
+		topicName, len(data))
+	return nil
 }
 
 // SubscribeTopic subscribes to a GossipSub topic.
@@ -920,8 +935,15 @@ func (n *Node) SubscribeTopic(topicName string) error {
 			if msg.ReceivedFrom == selfID {
 				continue
 			}
+			from := msg.ReceivedFrom.String()
+			short := from
+			if len(short) > 16 {
+				short = short[:16]
+			}
+			logP2pTransport("incoming PATH=GOSSIPSUB from=%s… topic=%s bytes=%d (mesh — same frame may arrive multiple times)",
+				short, topicName, len(msg.Data))
 			if h := n.msgHandler; h != nil {
-				h.OnMessage(msg.ReceivedFrom.String(), topicName, msg.Data)
+				h.OnMessage(from, topicName, msg.Data)
 			}
 		}
 	}()
@@ -945,18 +967,96 @@ func (n *Node) SetConnectionHandler(handler ConnectionHandler) {
 	n.connHandler = handler
 }
 
-// SendToPeer sends data directly to a peer via a libp2p stream.
-// Optimized: reuses pooled streams, compresses large payloads, buffered single-write framing.
-//
-// Protocol v2 frame format (OptimizedDMProtocol):
-//
-//	[1 byte flags] [4 bytes length] [payload]
-//	flags: 0x01 = compressed (zlib)
-//
-// Protocol v1 frame format (DirectMessageProtocol, legacy fallback):
-//
-//	[4 bytes length] [payload]
+// SendToPeer sends one application payload on the direct-message stream (v2 pooled when available).
 func (n *Node) SendToPeer(targetPeerID string, data []byte) error {
+	return n.sendDirectFrames(targetPeerID, [][]byte{data})
+}
+
+// SendBatchToPeer unpacks a JNI batch and sends each payload as its own v2 wire frame on the same pooled stream.
+// Packed format (big-endian):
+//
+//	[uint32 count][uint32 len0][payload0][uint32 len1][payload1]...
+//
+// Limits: count <= maxBatchFrames, each len <= maxMessageSize, sum(len) <= maxBatchTotalBytes.
+// One JNI call → one dial/pool path → N framed writes (fewer Java→Go crossings than N×SendToPeer).
+func (n *Node) SendBatchToPeer(targetPeerID string, packed []byte) error {
+	frames, err := unpackDirectBatch(packed)
+	if err != nil {
+		return err
+	}
+	return n.sendDirectFrames(targetPeerID, frames)
+}
+
+func unpackDirectBatch(packed []byte) ([][]byte, error) {
+	if len(packed) < 4 {
+		return nil, fmt.Errorf("batch: too short")
+	}
+	count := int(binary.BigEndian.Uint32(packed[0:4]))
+	if count < 1 || count > maxBatchFrames {
+		return nil, fmt.Errorf("batch: invalid count %d", count)
+	}
+	off := 4
+	sum := 0
+	out := make([][]byte, 0, count)
+	for i := 0; i < count; i++ {
+		if off+4 > len(packed) {
+			return nil, fmt.Errorf("batch: truncated header at frame %d", i)
+		}
+		ln := int(binary.BigEndian.Uint32(packed[off : off+4]))
+		off += 4
+		if ln < 0 || ln > maxMessageSize {
+			return nil, fmt.Errorf("batch: invalid frame len %d", ln)
+		}
+		sum += ln
+		if sum > maxBatchTotalBytes {
+			return nil, fmt.Errorf("batch: total size exceeds limit")
+		}
+		if off+ln > len(packed) {
+			return nil, fmt.Errorf("batch: truncated payload at frame %d", i)
+		}
+		frame := make([]byte, ln)
+		copy(frame, packed[off:off+ln])
+		out = append(out, frame)
+		off += ln
+	}
+	if off != len(packed) {
+		return nil, fmt.Errorf("batch: trailing bytes")
+	}
+	return out, nil
+}
+
+func writeV1Frame(s network.Stream, data []byte) error {
+	if len(data) > maxMessageSize {
+		return fmt.Errorf("message too large")
+	}
+	length := uint32(len(data))
+	buf := make([]byte, 4+len(data))
+	buf[0] = byte(length >> 24)
+	buf[1] = byte(length >> 16)
+	buf[2] = byte(length >> 8)
+	buf[3] = byte(length)
+	copy(buf[4:], data)
+	_, err := s.Write(buf)
+	return err
+}
+
+// sendDirectFrames sends one or more payloads; each becomes one v2 frame (or one v1 message per stream on legacy).
+func (n *Node) sendDirectFrames(targetPeerID string, frames [][]byte) error {
+	if len(frames) == 0 {
+		return fmt.Errorf("empty batch")
+	}
+	single := len(frames) == 1
+	var total int
+	for _, f := range frames {
+		if len(f) > maxMessageSize {
+			return fmt.Errorf("frame too large: %d", len(f))
+		}
+		total += len(f)
+		if total > maxBatchTotalBytes {
+			return fmt.Errorf("batch total too large")
+		}
+	}
+
 	n.mu.RLock()
 	h := n.host
 	ok := n.running
@@ -972,38 +1072,60 @@ func (n *Node) SendToPeer(targetPeerID string, data []byte) error {
 	}
 
 	connected := h.Network().Connectedness(pid) == network.Connected
-	fmt.Printf("p2pmobile: SendToPeer to %s connected=%v size=%d\n", pid.String()[:16], connected, len(data))
+	pidShort := pid.String()
+	if len(pidShort) > 16 {
+		pidShort = pidShort[:16]
+	}
+	op := "SendToPeer"
+	if !single {
+		op = "SendBatchToPeer"
+	}
+	fmt.Printf("p2pmobile: %s to %s connected=%v frames=%d totalBytes=%d\n", op, pidShort, connected, len(frames), total)
+	logP2pTransport("%s START peer=%s… connected=%v frames=%d totalBytes=%d", op, pidShort, connected, len(frames), total)
+
 	if !connected {
 		if err := n.dialPeer(pid); err != nil {
+			logP2pTransport("%s PATH_FAIL dial peer=%s… err=%v — Android may fall back to GossipSub/WebSocket", op, pidShort, err)
 			return fmt.Errorf("dial: %w", err)
 		}
 	}
 
-	// ── Try pooled stream first (zero-RTT for subsequent messages) ──
+	// ── Pooled v2 stream ─────────────────────────────────────────────
 	if ps := n.getPooledStream(targetPeerID); ps != nil {
-		err := n.writeToPooledStream(ps, data)
-		if err == nil {
+		var writeErr error
+		for _, data := range frames {
+			if writeErr = n.writeToPooledStream(ps, data); writeErr != nil {
+				break
+			}
+		}
+		if writeErr == nil {
 			remoteAddr := ps.stream.Conn().RemoteMultiaddr().String()
 			connType := "DIRECT"
 			if strings.Contains(remoteAddr, "p2p-circuit") {
 				connType = "RELAY"
 			}
-			fmt.Printf("p2pmobile: SendToPeer OK (pooled) — %d bytes to %s type=%s\n", len(data), pid.String()[:16], connType)
+			fmt.Printf("p2pmobile: %s OK (pooled) — frames=%d totalBytes=%d to %s type=%s\n", op, len(frames), total, pidShort, connType)
+			logP2pTransport("%s PATH=LIBP2P_STREAM ok=true peer=%s… frames=%d totalBytes=%d conn=%s (pooled v2)",
+				op, pidShort, len(frames), total, connType)
 			return nil
 		}
-		// Pooled stream broken — evict and fall through to new stream
-		fmt.Printf("p2pmobile: SendToPeer pooled stream broken for %s: %v — opening new\n", pid.String()[:16], err)
+		fmt.Printf("p2pmobile: %s pooled stream broken for %s: %v — opening new\n", op, pidShort, writeErr)
 		n.evictPooledStream(targetPeerID)
+		// Avoid duplicate frames if we already wrote part of a multi-frame batch.
+		if !single {
+			return fmt.Errorf("pooled write: %w", writeErr)
+		}
 	}
 
-	// ── Open new stream — try v2 (optimized) first, fall back to v1 ──
+	// ── New stream: v2 first, else v1 ───────────────────────────────
 	ctx, cancel := context.WithTimeout(n.ctx, 10*time.Second)
 	defer cancel()
 	ctx = network.WithAllowLimitedConn(ctx, "relay-dm")
 
 	s, err := h.NewStream(ctx, pid, protocol.ID(OptimizedDMProtocol), protocol.ID(DirectMessageProtocol))
 	if err != nil {
-		fmt.Printf("p2pmobile: SendToPeer NewStream FAILED to %s: %v\n", pid.String()[:16], err)
+		fmt.Printf("p2pmobile: %s NewStream FAILED to %s: %v\n", op, pidShort, err)
+		logP2pTransport("%s PATH_FAIL NewStream peer=%s… err=%v — Android may fall back to GossipSub/WebSocket", op, pidShort, err)
 		return fmt.Errorf("stream: %w", err)
 	}
 
@@ -1013,40 +1135,51 @@ func (n *Node) SendToPeer(targetPeerID string, data []byte) error {
 	if strings.Contains(remoteAddr, "p2p-circuit") {
 		connType = "RELAY"
 	}
-	fmt.Printf("p2pmobile: SendToPeer new stream proto=%s type=%s addr=%s\n", negotiated, connType, remoteAddr)
+	fmt.Printf("p2pmobile: %s new stream proto=%s type=%s addr=%s\n", op, negotiated, connType, remoteAddr)
+	logP2pTransport("%s PATH=LIBP2P_STREAM new_stream peer=%s… proto=%s conn=%s addr=%s",
+		op, pidShort, negotiated, connType, remoteAddr)
 
 	if negotiated == OptimizedDMProtocol {
-		// v2: pool this stream for reuse + write with compression
 		ps := &pooledStream{
 			stream:  s,
-			writer:  bufio.NewWriterSize(s, 64*1024), // 64KB write buffer
+			writer:  bufio.NewWriterSize(s, 64*1024),
 			lastUse: time.Now(),
 		}
 		n.putPooledStream(targetPeerID, ps)
-		if err := n.writeToPooledStream(ps, data); err != nil {
-			n.evictPooledStream(targetPeerID)
-			return err
+		for _, data := range frames {
+			if err := n.writeToPooledStream(ps, data); err != nil {
+				n.evictPooledStream(targetPeerID)
+				return err
+			}
 		}
-		fmt.Printf("p2pmobile: SendToPeer OK (new v2, pooled) — %d bytes to %s\n", len(data), pid.String()[:16])
+		fmt.Printf("p2pmobile: %s OK (new v2, pooled) — frames=%d totalBytes=%d to %s\n", op, len(frames), total, pidShort)
+		logP2pTransport("%s PATH=LIBP2P_STREAM ok=true peer=%s… frames=%d totalBytes=%d proto=v2_pooled conn=%s",
+			op, pidShort, len(frames), total, connType)
 		return nil
 	}
 
-	// v1 legacy: single-use stream, no compression
-	defer s.Close()
-	length := uint32(len(data))
-	// Combine header + body into single write (avoids Nagle delay between 2 packets)
-	buf := make([]byte, 4+len(data))
-	buf[0] = byte(length >> 24)
-	buf[1] = byte(length >> 16)
-	buf[2] = byte(length >> 8)
-	buf[3] = byte(length)
-	copy(buf[4:], data)
-	if _, err := s.Write(buf); err != nil {
-		fmt.Printf("p2pmobile: SendToPeer v1 write FAILED to %s: %v\n", pid.String()[:16], err)
-		s.Reset()
-		return err
+	// v1: one length-prefixed message per stream (close after each frame)
+	for i, data := range frames {
+		var st network.Stream
+		if i == 0 {
+			st = s
+		} else {
+			s2, err2 := h.NewStream(ctx, pid, protocol.ID(DirectMessageProtocol))
+			if err2 != nil {
+				return fmt.Errorf("v1 stream %d: %w", i, err2)
+			}
+			st = s2
+		}
+		if err := writeV1Frame(st, data); err != nil {
+			st.Reset()
+			fmt.Printf("p2pmobile: %s v1 write FAILED to %s: %v\n", op, pidShort, err)
+			return err
+		}
+		_ = st.Close()
 	}
-	fmt.Printf("p2pmobile: SendToPeer OK (v1) — %d bytes to %s\n", len(data), pid.String()[:16])
+	fmt.Printf("p2pmobile: %s OK (v1) — frames=%d totalBytes=%d to %s\n", op, len(frames), total, pidShort)
+	logP2pTransport("%s PATH=LIBP2P_STREAM ok=true peer=%s… frames=%d totalBytes=%d proto=v1 conn=%s",
+		op, pidShort, len(frames), total, connType)
 	return nil
 }
 
@@ -1226,13 +1359,19 @@ func (n *Node) dialPeer(pid peer.ID) error {
 func (n *Node) handleDirectStream(s network.Stream) {
 	defer s.Close()
 	from := s.Conn().RemotePeer().String()
+	fromShort := from
+	if len(fromShort) > 16 {
+		fromShort = fromShort[:16]
+	}
 	remoteAddr := s.Conn().RemoteMultiaddr().String()
 	connType := "DIRECT"
 	if strings.Contains(remoteAddr, "p2p-circuit") {
 		connType = "RELAY"
 	}
 	fmt.Printf("p2pmobile: incoming direct stream from %s type=%s addr=%s (dir=%s)\n",
-		from[:16], connType, remoteAddr, s.Conn().Stat().Direction)
+		fromShort, connType, remoteAddr, s.Conn().Stat().Direction)
+	logP2pTransport("incoming PATH=LIBP2P_STREAM_V1 open from=%s… conn=%s dir=%v addr=%s",
+		fromShort, connType, s.Conn().Stat().Direction, remoteAddr)
 
 	hdr := make([]byte, 4)
 	if _, err := io.ReadFull(s, hdr); err != nil {
@@ -1250,13 +1389,14 @@ func (n *Node) handleDirectStream(s network.Stream) {
 		return
 	}
 	fmt.Printf("p2pmobile: direct stream received %d bytes from %s\n", length, from)
+	logP2pTransport("incoming PATH=LIBP2P_STREAM_V1 from=%s… bytes=%d conn=%s (unicast stream, not GossipSub)",
+		fromShort, length, connType)
 
 	if h := n.directHandler; h != nil {
 		h.OnDirectMessage(from, data)
 	}
-	if h := n.msgHandler; h != nil {
-		h.OnMessage(from, "direct", data)
-	}
+	// Do not call MessageHandler for direct streams — avoids duplicate JNI delivery
+	// (Kotlin already ingests via DirectMessageHandler → same bytes as GossipSub path).
 }
 
 // -------- identity persistence --------
@@ -1396,12 +1536,18 @@ func (n *Node) writeToPooledStream(ps *pooledStream, data []byte) error {
 func (n *Node) handleOptimizedStream(s network.Stream) {
 	// v2 streams are persistent — do NOT close on return. Read in a loop.
 	from := s.Conn().RemotePeer().String()
+	fromShort := from
+	if len(fromShort) > 16 {
+		fromShort = fromShort[:16]
+	}
 	remoteAddr := s.Conn().RemoteMultiaddr().String()
 	connType := "DIRECT"
 	if strings.Contains(remoteAddr, "p2p-circuit") {
 		connType = "RELAY"
 	}
-	fmt.Printf("p2pmobile: incoming v2 stream from %s type=%s addr=%s\n", from[:16], connType, remoteAddr)
+	fmt.Printf("p2pmobile: incoming v2 stream from %s type=%s addr=%s\n", fromShort, connType, remoteAddr)
+	logP2pTransport("incoming PATH=LIBP2P_STREAM_V2 open from=%s… conn=%s addr=%s (persistent dm/2.0.0)",
+		fromShort, connType, remoteAddr)
 
 	reader := bufio.NewReaderSize(s, 64*1024)
 	for {
@@ -1409,23 +1555,23 @@ func (n *Node) handleOptimizedStream(s network.Stream) {
 		flagsByte, err := reader.ReadByte()
 		if err != nil {
 			if err != io.EOF {
-				fmt.Printf("p2pmobile: v2 stream closed from %s: %v\n", from[:16], err)
+				fmt.Printf("p2pmobile: v2 stream closed from %s: %v\n", fromShort, err)
 			}
 			return
 		}
 		hdr := make([]byte, 4)
 		if _, err := io.ReadFull(reader, hdr); err != nil {
-			fmt.Printf("p2pmobile: v2 length read error from %s: %v\n", from[:16], err)
+			fmt.Printf("p2pmobile: v2 length read error from %s: %v\n", fromShort, err)
 			return
 		}
 		length := uint32(hdr[0])<<24 | uint32(hdr[1])<<16 | uint32(hdr[2])<<8 | uint32(hdr[3])
 		if length > maxMessageSize {
-			fmt.Printf("p2pmobile: v2 message too large from %s: %d bytes\n", from[:16], length)
+			fmt.Printf("p2pmobile: v2 message too large from %s: %d bytes\n", fromShort, length)
 			return
 		}
 		payload := make([]byte, length)
 		if _, err := io.ReadFull(reader, payload); err != nil {
-			fmt.Printf("p2pmobile: v2 body read error from %s: %v\n", from[:16], err)
+			fmt.Printf("p2pmobile: v2 body read error from %s: %v\n", fromShort, err)
 			return
 		}
 
@@ -1434,26 +1580,26 @@ func (n *Node) handleOptimizedStream(s network.Stream) {
 		if flagsByte&0x01 != 0 {
 			r, err := zlib.NewReader(bytes.NewReader(payload))
 			if err != nil {
-				fmt.Printf("p2pmobile: v2 zlib init error from %s: %v\n", from[:16], err)
+				fmt.Printf("p2pmobile: v2 zlib init error from %s: %v\n", fromShort, err)
 				continue
 			}
 			decompressed, err := io.ReadAll(r)
 			r.Close()
 			if err != nil {
-				fmt.Printf("p2pmobile: v2 zlib read error from %s: %v\n", from[:16], err)
+				fmt.Printf("p2pmobile: v2 zlib read error from %s: %v\n", fromShort, err)
 				continue
 			}
 			data = decompressed
-			fmt.Printf("p2pmobile: [decompress] %d → %d bytes from %s\n", len(payload), len(data), from[:16])
+			fmt.Printf("p2pmobile: [decompress] %d → %d bytes from %s\n", len(payload), len(data), fromShort)
 		}
 
-		fmt.Printf("p2pmobile: v2 received %d bytes from %s\n", len(data), from[:16])
+		fmt.Printf("p2pmobile: v2 received %d bytes from %s\n", len(data), fromShort)
+		logP2pTransport("incoming PATH=LIBP2P_STREAM_V2 from=%s… bytes=%d conn=%s (unicast v2 frame)",
+			fromShort, len(data), connType)
 		if h := n.directHandler; h != nil {
 			h.OnDirectMessage(from, data)
 		}
-		if h := n.msgHandler; h != nil {
-			h.OnMessage(from, "direct", data)
-		}
+		// Direct frames are not GossipSub — only DirectMessageHandler (single JNI path).
 	}
 }
 
