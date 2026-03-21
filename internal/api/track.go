@@ -1,8 +1,6 @@
 package api
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -32,9 +30,10 @@ type createSessionReq struct {
 }
 
 type createSessionResp struct {
-	SessionID string `json:"sessionId"`
-	JoinURL   string `json:"joinUrl"`
-	ExpiresAt int64  `json:"expiresAt"`
+	SessionID       string `json:"sessionId"`
+	JoinURL         string `json:"joinUrl"`
+	ExpiresAt       int64  `json:"expiresAt"`
+	DurationMinutes int    `json:"durationMinutes"`
 }
 
 func (t *TrackAPI) CreateSession(w http.ResponseWriter, r *http.Request) {
@@ -60,23 +59,50 @@ func (t *TrackAPI) CreateSession(w http.ResponseWriter, r *http.Request) {
 		req.DurationMinutes = 120
 	}
 
-	sessionID := generateSessionID()
-	session, err := t.store.CreateTrackSession(r.Context(), sessionID, req.PeerID, req.DurationMinutes)
+	session, err := t.store.CreateTrackSession(r.Context(), req.PeerID, req.DurationMinutes)
 	if err != nil {
 		slog.Error("track_create_session_failed", "peer_id", req.PeerID, "err", err)
 		http.Error(w, "failed to create session", http.StatusInternalServerError)
 		return
 	}
 
+	sessionID := session.SessionID
 	joinURL := "https://www.ridechain.in/track/join/" + sessionID
 	slog.Info("track_session_created", "session_id", sessionID, "owner", req.PeerID, "duration", req.DurationMinutes)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(createSessionResp{
-		SessionID: sessionID,
-		JoinURL:   joinURL,
-		ExpiresAt: session.ExpiresAt,
+		SessionID:       sessionID,
+		JoinURL:         joinURL,
+		ExpiresAt:       session.ExpiresAt,
+		DurationMinutes: session.DurationMinutes,
 	})
+}
+
+// GetMySession handles GET /track/sessions/me?peerId=...
+// Returns the owner's single active track session, if any.
+func (t *TrackAPI) GetMySession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	ownerPeerID := strings.TrimSpace(r.URL.Query().Get("peerId"))
+	if ownerPeerID == "" {
+		http.Error(w, "peerId required", http.StatusBadRequest)
+		return
+	}
+	session, err := t.store.GetOwnerActiveTrackSession(r.Context(), ownerPeerID)
+	if err != nil {
+		slog.Error("track_get_my_session_failed", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if session == nil {
+		http.Error(w, "no active session", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(session)
 }
 
 // --- GET /track/sessions/{id} ---
@@ -116,6 +142,7 @@ func (t *TrackAPI) GetSession(w http.ResponseWriter, r *http.Request) {
 type trackRequestReq struct {
 	WatcherPeerID string `json:"watcherPeerId"`
 	WatcherName   string `json:"watcherName"`
+	WatcherCity   string `json:"watcherCity"`
 }
 
 func (t *TrackAPI) RequestToTrack(w http.ResponseWriter, r *http.Request) {
@@ -159,21 +186,26 @@ func (t *TrackAPI) RequestToTrack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	watcherName := strings.TrimSpace(req.WatcherName)
+	if watcherName == "" {
+		watcherName = "Someone"
+	}
+	if err := t.store.SetWatcherRequestMeta(r.Context(), sessionID, req.WatcherPeerID, watcherName, req.WatcherCity, ttl); err != nil {
+		slog.Warn("track_set_watcher_meta_failed", "session_id", sessionID, "watcher", req.WatcherPeerID, "err", err)
+	}
+
 	// Send FCM push to the session owner
 	ownerMeta, err := t.store.GetPeer(r.Context(), session.OwnerPeerID)
 	if err != nil {
 		slog.Warn("track_request_get_owner_failed", "owner", session.OwnerPeerID, "err", err)
 	}
 	if ownerMeta != nil && ownerMeta.FCMToken != "" {
-		watcherName := strings.TrimSpace(req.WatcherName)
-		if watcherName == "" {
-			watcherName = "Someone"
-		}
 		pushData := map[string]string{
 			"type":            "track_request",
 			"session_id":      sessionID,
 			"watcher_peer_id": req.WatcherPeerID,
 			"watcher_name":    watcherName,
+			"watcher_city":    strings.TrimSpace(req.WatcherCity),
 			"title":           "Location Request",
 			"body":            watcherName + " wants to see your live location",
 		}
@@ -428,6 +460,52 @@ func (t *TrackAPI) GetWatcherStatus(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": string(status)})
 }
 
+// ListPendingRequests handles GET /track/sessions/{id}/pending-requests?ownerPeerId=...
+func (t *TrackAPI) ListPendingRequests(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	sessionID := extractTrackSubPath(r.URL.Path, "/pending-requests")
+	if sessionID == "" {
+		http.Error(w, "sessionId required", http.StatusBadRequest)
+		return
+	}
+	ownerPeerID := strings.TrimSpace(r.URL.Query().Get("ownerPeerId"))
+	if ownerPeerID == "" {
+		http.Error(w, "ownerPeerId required", http.StatusBadRequest)
+		return
+	}
+	session, err := t.store.GetTrackSession(r.Context(), sessionID)
+	if err != nil || session == nil {
+		http.Error(w, "session not found or expired", http.StatusNotFound)
+		return
+	}
+	if time.Now().Unix() > session.ExpiresAt {
+		http.Error(w, "session expired", http.StatusGone)
+		return
+	}
+	if session.OwnerPeerID != ownerPeerID {
+		http.Error(w, "unauthorized", http.StatusForbidden)
+		return
+	}
+	list, err := t.store.ListPendingTrackRequests(r.Context(), sessionID)
+	if err != nil {
+		slog.Error("track_list_pending_failed", "session_id", sessionID, "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	// Always JSON array, never null (clients deserialize into List).
+	if list == nil {
+		list = []redis.PendingTrackRequest{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"sessionId": sessionID,
+		"requests":  list,
+	})
+}
+
 // RouteSession dispatches /track/sessions/{id}[/sub] to the correct handler.
 func (t *TrackAPI) RouteSession(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
@@ -436,6 +514,8 @@ func (t *TrackAPI) RouteSession(w http.ResponseWriter, r *http.Request) {
 		t.RequestToTrack(w, r)
 	case strings.HasSuffix(path, "/respond"):
 		t.RespondToRequest(w, r)
+	case strings.HasSuffix(path, "/pending-requests"):
+		t.ListPendingRequests(w, r)
 	case strings.HasSuffix(path, "/location") && r.Method == http.MethodPost:
 		t.PublishLocation(w, r)
 	case strings.HasSuffix(path, "/location") && r.Method == http.MethodGet:
@@ -470,10 +550,4 @@ func extractTrackSubPath(path, suffix string) string {
 	sessionID := strings.TrimSuffix(rest, suffix)
 	sessionID = strings.TrimRight(sessionID, "/")
 	return strings.TrimSpace(sessionID)
-}
-
-func generateSessionID() string {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
 }

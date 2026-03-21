@@ -217,7 +217,7 @@ func (h *HTTPServer) RecoverPeer(w http.ResponseWriter, r *http.Request) {
 }
 
 // SearchByName handles GET /search-by-name?name=...
-// Returns peers with peerId and displayName (for UI display).
+// Returns peers with peerId, displayName, optional lat/lng, and lastActive (UpdatedAt unix seconds).
 func (h *HTTPServer) SearchByName(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -246,16 +246,27 @@ func (h *HTTPServer) SearchByName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	type peerResult struct {
-		PeerID      string `json:"peerId"`
-		DisplayName string `json:"displayName"`
+		PeerID      string  `json:"peerId"`
+		DisplayName string  `json:"displayName"`
+		Lat         float64 `json:"lat,omitempty"`
+		Lng         float64 `json:"lng,omitempty"`
+		LastActive  int64   `json:"lastActive,omitempty"`
 	}
 	peers := make([]peerResult, 0, len(peerIDs))
 	for i, meta := range metas {
 		if meta == nil {
 			peers = append(peers, peerResult{PeerID: peerIDs[i], DisplayName: ""})
-		} else {
-			peers = append(peers, peerResult{PeerID: meta.PeerID, DisplayName: meta.DisplayName})
+			continue
 		}
+		pr := peerResult{PeerID: meta.PeerID, DisplayName: meta.DisplayName}
+		if meta.UpdatedAt > 0 {
+			pr.LastActive = meta.UpdatedAt
+		}
+		if meta.Lat != 0 || meta.Lng != 0 {
+			pr.Lat = meta.Lat
+			pr.Lng = meta.Lng
+		}
+		peers = append(peers, pr)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"peers": peers})

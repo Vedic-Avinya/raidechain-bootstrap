@@ -2,26 +2,31 @@ package redis
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	rdb "github.com/redis/go-redis/v9"
 )
 
 const (
-	keyTrackSession  = "track:session:"          // {sessionId} -> JSON
-	keyTrackLocation = "track:session:location:"  // {sessionId} -> JSON {lat,lng,ts}
-	keyTrackWatcher  = "track:session:watcher:"   // {sessionId}:{watcherPeerId} -> status
-	maxSessionTTL    = 3 * time.Hour              // hard cap
+	keyTrackSession      = "track:session:"         // {sessionId} -> JSON
+	keyTrackLocation     = "track:session:location:" // {sessionId} -> JSON {lat,lng,ts}
+	keyTrackWatcher      = "track:session:watcher:"  // {sessionId}:{watcherPeerId} -> status
+	keyTrackWatcherMeta  = "track:session:watcher_meta:"
+	keyTrackOwnerSession = "track:owner_session:" // {ownerPeerId} -> sessionId
+	maxSessionTTL        = 3 * time.Hour
 )
 
 // TrackSessionStatus represents the lifecycle of a tracking session.
 type TrackSessionStatus string
 
 const (
-	TrackStatusActive   TrackSessionStatus = "active"
-	TrackStatusExpired  TrackSessionStatus = "expired"
+	TrackStatusActive  TrackSessionStatus = "active"
+	TrackStatusExpired TrackSessionStatus = "expired"
 )
 
 // WatcherStatus represents a watcher's request state.
@@ -38,9 +43,16 @@ type TrackSession struct {
 	SessionID       string `json:"session_id"`
 	OwnerPeerID     string `json:"owner_peer_id"`
 	DurationMinutes int    `json:"duration_minutes"`
-	CreatedAt       int64  `json:"created_at"`       // unix seconds
-	ExpiresAt       int64  `json:"expires_at"`        // unix seconds
-	Status          string `json:"status"`            // active, expired
+	CreatedAt       int64  `json:"created_at"` // unix seconds
+	ExpiresAt       int64  `json:"expires_at"` // unix seconds
+	Status          string `json:"status"`     // active, expired
+}
+
+// PendingTrackRequest is a watcher waiting for owner approval.
+type PendingTrackRequest struct {
+	WatcherPeerID string `json:"watcherPeerId"`
+	DisplayName   string `json:"displayName"`
+	City          string `json:"city"`
 }
 
 // TrackLocation is the latest published location for a session.
@@ -50,13 +62,29 @@ type TrackLocation struct {
 	Timestamp int64   `json:"timestamp"` // unix seconds
 }
 
-// CreateTrackSession creates a new live tracking session in Redis.
-func (s *Store) CreateTrackSession(ctx context.Context, sessionID, ownerPeerID string, durationMinutes int) (*TrackSession, error) {
-	now := time.Now().Unix()
+// CreateTrackSession creates or reuses the owner's single active track session in Redis.
+func (s *Store) CreateTrackSession(ctx context.Context, ownerPeerID string, durationMinutes int) (*TrackSession, error) {
+	ownerPeerID = strings.TrimSpace(ownerPeerID)
+	if ownerPeerID == "" {
+		return nil, fmt.Errorf("owner peer id required")
+	}
 	ttl := time.Duration(durationMinutes) * time.Minute
 	if ttl > maxSessionTTL {
 		ttl = maxSessionTTL
 	}
+
+	// One active session per owner: reuse if still valid.
+	if sid, err := s.client.Get(ctx, keyTrackOwnerSession+ownerPeerID).Result(); err == nil && sid != "" {
+		if existing, err := s.GetTrackSession(ctx, sid); err == nil && existing != nil {
+			if time.Now().Unix() <= existing.ExpiresAt && existing.OwnerPeerID == ownerPeerID {
+				return existing, nil
+			}
+		}
+		_ = s.client.Del(ctx, keyTrackOwnerSession+ownerPeerID).Err()
+	}
+
+	sessionID := randomTrackSessionID()
+	now := time.Now().Unix()
 	session := TrackSession{
 		SessionID:       sessionID,
 		OwnerPeerID:     ownerPeerID,
@@ -69,10 +97,46 @@ func (s *Store) CreateTrackSession(ctx context.Context, sessionID, ownerPeerID s
 	if err != nil {
 		return nil, err
 	}
-	if err := s.client.Set(ctx, keyTrackSession+sessionID, data, ttl).Err(); err != nil {
+	pipe := s.client.Pipeline()
+	pipe.Set(ctx, keyTrackSession+sessionID, data, ttl)
+	pipe.Set(ctx, keyTrackOwnerSession+ownerPeerID, sessionID, ttl)
+	_, err = pipe.Exec(ctx)
+	if err != nil {
 		return nil, err
 	}
 	return &session, nil
+}
+
+func randomTrackSessionID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// GetOwnerActiveTrackSession returns the non-expired session mapped to this owner, if any.
+func (s *Store) GetOwnerActiveTrackSession(ctx context.Context, ownerPeerID string) (*TrackSession, error) {
+	ownerPeerID = strings.TrimSpace(ownerPeerID)
+	if ownerPeerID == "" {
+		return nil, nil
+	}
+	sid, err := s.client.Get(ctx, keyTrackOwnerSession+ownerPeerID).Result()
+	if err == rdb.Nil || sid == "" {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	sess, err := s.GetTrackSession(ctx, sid)
+	if err != nil || sess == nil {
+		return nil, err
+	}
+	if time.Now().Unix() > sess.ExpiresAt {
+		return nil, nil
+	}
+	if sess.OwnerPeerID != ownerPeerID {
+		return nil, nil
+	}
+	return sess, nil
 }
 
 // GetTrackSession returns the session metadata. Returns nil if expired or not found.
@@ -99,6 +163,71 @@ func (s *Store) GetTrackSession(ctx context.Context, sessionID string) (*TrackSe
 func (s *Store) SetWatcherStatus(ctx context.Context, sessionID, watcherPeerID string, status WatcherStatus, ttl time.Duration) error {
 	key := fmt.Sprintf("%s%s:%s", keyTrackWatcher, sessionID, watcherPeerID)
 	return s.client.Set(ctx, key, string(status), ttl).Err()
+}
+
+// SetWatcherRequestMeta stores display name and city shown to the session owner (same TTL as status).
+func (s *Store) SetWatcherRequestMeta(ctx context.Context, sessionID, watcherPeerID, displayName, city string, ttl time.Duration) error {
+	type meta struct {
+		DisplayName string `json:"displayName"`
+		City        string `json:"city"`
+	}
+	b, err := json.Marshal(meta{DisplayName: displayName, City: strings.TrimSpace(city)})
+	if err != nil {
+		return err
+	}
+	key := fmt.Sprintf("%s%s:%s", keyTrackWatcherMeta, sessionID, watcherPeerID)
+	return s.client.Set(ctx, key, b, ttl).Err()
+}
+
+func (s *Store) getWatcherRequestMeta(ctx context.Context, sessionID, watcherPeerID string) (displayName, city string) {
+	key := fmt.Sprintf("%s%s:%s", keyTrackWatcherMeta, sessionID, watcherPeerID)
+	b, err := s.client.Get(ctx, key).Bytes()
+	if err != nil {
+		return "", ""
+	}
+	var m struct {
+		DisplayName string `json:"displayName"`
+		City        string `json:"city"`
+	}
+	_ = json.Unmarshal(b, &m)
+	return m.DisplayName, m.City
+}
+
+// ListPendingTrackRequests returns watchers in "requested" state for the session.
+func (s *Store) ListPendingTrackRequests(ctx context.Context, sessionID string) ([]PendingTrackRequest, error) {
+	pattern := fmt.Sprintf("%s%s:*", keyTrackWatcher, sessionID)
+	var keys []string
+	var cursor uint64
+	for {
+		batch, next, err := s.client.Scan(ctx, cursor, pattern, 64).Result()
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, batch...)
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	prefix := fmt.Sprintf("%s%s:", keyTrackWatcher, sessionID)
+	var out []PendingTrackRequest
+	for _, key := range keys {
+		status, err := s.client.Get(ctx, key).Result()
+		if err != nil || status != string(WatcherRequested) {
+			continue
+		}
+		watcherPeerID := strings.TrimPrefix(key, prefix)
+		if watcherPeerID == "" {
+			continue
+		}
+		dn, city := s.getWatcherRequestMeta(ctx, sessionID, watcherPeerID)
+		out = append(out, PendingTrackRequest{
+			WatcherPeerID: watcherPeerID,
+			DisplayName:   dn,
+			City:          city,
+		})
+	}
+	return out, nil
 }
 
 // GetWatcherStatus returns the watcher's current status for a session.

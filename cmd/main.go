@@ -278,7 +278,8 @@ func main() {
 		// Persistent DB: stats and peer recovery
 		apiMux.HandleFunc("GET /stats", apiSrv.Stats)
 		apiMux.HandleFunc("GET /recover-peer", apiSrv.RecoverPeer)
-		// Live tracking session endpoints
+		// Live tracking session endpoints (register /track/sessions/me before /track/sessions/ prefix)
+		apiMux.HandleFunc("GET /track/sessions/me", trackAPI.GetMySession)
 		apiMux.HandleFunc("POST /track/sessions", trackAPI.CreateSession)
 		apiMux.HandleFunc("/track/sessions/", trackAPI.RouteSession)
 		rl := api.NewIPRateLimiter()
