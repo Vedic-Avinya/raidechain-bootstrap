@@ -282,6 +282,8 @@ func main() {
 		apiMux.HandleFunc("GET /track/sessions/me", trackAPI.GetMySession)
 		apiMux.HandleFunc("POST /track/sessions", trackAPI.CreateSession)
 		apiMux.HandleFunc("/track/sessions/", trackAPI.RouteSession)
+		// WebRTC: STUN + ephemeral TURN (coturn REST / shared secret); see TURN_* env vars.
+		apiMux.HandleFunc("GET /webrtc/turn", apiSrv.TurnCredentials)
 		rl := api.NewIPRateLimiter()
 		// Chain: rate limiter → JWT middleware → mux
 		jwtMiddleware := deviceauth.Middleware(jwtIssuer)
@@ -295,7 +297,7 @@ func main() {
 		}
 		go func() {
 			slog.Info("http_api", "msg", "listening", "port", httpAPIPort,
-				"paths", []string{"/register", "/search-by-name", "/discover", "/track/sessions"})
+				"paths", []string{"/register", "/search-by-name", "/discover", "/track/sessions", "/webrtc/turn"})
 			if err := apiServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				slog.Error("http_api", "msg", "server error", "err", err)
 			}
