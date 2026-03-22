@@ -833,26 +833,30 @@ func (n *Node) ConnectedPeers() string {
 	return strings.Join(out, ",")
 }
 
-// IsDirectConnection returns true if the current connection to the given peer
-// is direct (not via relay). Used by the UI to show hole-punched status.
-func (n *Node) IsDirectConnection(peerID string) bool {
+// hasDirectConnToPeer reports whether any open connection to [pid] is not a relay circuit.
+func (n *Node) hasDirectConnToPeer(pid peer.ID) bool {
 	n.mu.RLock()
 	h := n.host
 	n.mu.RUnlock()
 	if h == nil {
 		return false
 	}
+	for _, c := range h.Network().ConnsToPeer(pid) {
+		if !strings.Contains(c.RemoteMultiaddr().String(), "p2p-circuit") {
+			return true
+		}
+	}
+	return false
+}
+
+// IsDirectConnection returns true if the current connection to the given peer
+// is direct (not via relay). Used by the UI to show hole-punched status.
+func (n *Node) IsDirectConnection(peerID string) bool {
 	pid, err := peer.Decode(strings.TrimSpace(peerID))
 	if err != nil {
 		return false
 	}
-	conns := h.Network().ConnsToPeer(pid)
-	for _, c := range conns {
-		if !strings.Contains(c.RemoteMultiaddr().String(), "p2p-circuit") {
-			return true // at least one direct connection
-		}
-	}
-	return false
+	return n.hasDirectConnToPeer(pid)
 }
 
 // ConnectedPeerCount returns the number of connected peers.
@@ -1084,6 +1088,16 @@ func (n *Node) sendDirectFrames(targetPeerID string, frames [][]byte) error {
 		if err := n.dialPeer(pid); err != nil {
 			logP2pTransport("%s PATH_FAIL dial peer=%s… err=%v — Android may fall back to GossipSub/WebSocket", op, pidShort, err)
 			return fmt.Errorf("dial: %w", err)
+		}
+	}
+
+	// Drop a relay-only pooled stream as soon as a direct connection exists so the next
+	// open uses a better path (avoids UI showing "direct" while sends stay on circuit).
+	if ps := n.getPooledStream(targetPeerID); ps != nil {
+		ra := ps.stream.Conn().RemoteMultiaddr().String()
+		if strings.Contains(ra, "p2p-circuit") && n.hasDirectConnToPeer(pid) {
+			fmt.Printf("p2pmobile: [pool] evict relay stream — direct conn available for %s\n", pidShort)
+			n.evictPooledStream(targetPeerID)
 		}
 	}
 
