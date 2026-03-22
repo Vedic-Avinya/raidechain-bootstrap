@@ -17,11 +17,12 @@ import (
 	"compress/zlib"
 	"context"
 	"crypto/ed25519"
-	"crypto/rand"
+	crand "crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,6 +43,15 @@ import (
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/multiformats/go-multiaddr"
 )
+
+// directDialPasses is how many times we retry peerstore+DHT direct dials before circuit relay.
+// Jittered backoff between passes lets addresses/identify propagate (mobile handover).
+// Note: "99.99% direct" is not achievable on the open internet (CGNAT, offline peers, firewalls);
+// relay remains the correctness fallback; these passes maximize direct when paths exist.
+const directDialPasses = 3
+
+// dmWriterBufferSize is the pooled v2 stream bufio size — larger = fewer syscalls for blob batches.
+const dmWriterBufferSize = 512 * 1024
 
 const (
 	// DirectMessageProtocol is the libp2p stream protocol for 1-to-1 messages.
@@ -113,6 +123,10 @@ type Node struct {
 
 	ingressMu     sync.Mutex
 	ingressBudget map[string]*peerIngressBudget
+
+	// directProbeLast avoids hammering parallel direct dials while on relay (debounce per peer).
+	directProbeMu   sync.Mutex
+	directProbeLast map[string]time.Time
 }
 
 // pooledStream wraps a reusable libp2p stream with a buffered writer.
@@ -133,9 +147,10 @@ func init() {
 // NewNode creates a new P2P node (not started yet).
 func NewNode() *Node {
 	return &Node{
-		topics:     make(map[string]*pubsub.Topic),
-		subs:       make(map[string]*pubsub.Subscription),
-		streamPool: make(map[string]*pooledStream),
+		topics:            make(map[string]*pubsub.Topic),
+		subs:              make(map[string]*pubsub.Subscription),
+		streamPool:        make(map[string]*pooledStream),
+		directProbeLast:   make(map[string]time.Time),
 	}
 }
 
@@ -217,6 +232,9 @@ func (n *Node) Start(dataDir string, bootstrapMultiaddrs string) error {
 			isIPv6 := strings.Contains(remoteAddr, "/ip6/")
 			fmt.Printf("p2pmobile: ⚡ CONNECTED peer=%s type=%s ipv6=%v addr=%s dir=%s\n",
 				remotePeer[:16], connType, isIPv6, remoteAddr, c.Stat().Direction)
+			if connType == "RELAY" && !n.isBootstrapPeerID(c.RemotePeer()) {
+				n.maybeScheduleDirectProbe(remotePeer)
+			}
 			if ch := n.connHandler; ch != nil {
 				ch.OnPeerConnected(remotePeer)
 			}
@@ -859,6 +877,63 @@ func (n *Node) IsDirectConnection(peerID string) bool {
 	return n.hasDirectConnToPeer(pid)
 }
 
+func (n *Node) isBootstrapPeerID(id peer.ID) bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	for _, bp := range n.bootstrapPeers {
+		if bp.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// maybeScheduleDirectProbe starts a delayed peerstore+DHT direct dial while a relay path is up.
+// Relay stays connected if the probe fails (reachability, NAT). Debounced per peer.
+func (n *Node) maybeScheduleDirectProbe(peerIDStr string) {
+	pid, err := peer.Decode(strings.TrimSpace(peerIDStr))
+	if err != nil {
+		return
+	}
+	if n.isBootstrapPeerID(pid) {
+		return
+	}
+	n.directProbeMu.Lock()
+	now := time.Now()
+	if t, ok := n.directProbeLast[peerIDStr]; ok && now.Sub(t) < 45*time.Second {
+		n.directProbeMu.Unlock()
+		return
+	}
+	if len(n.directProbeLast) > 500 {
+		n.directProbeLast = make(map[string]time.Time)
+	}
+	n.directProbeLast[peerIDStr] = now
+	n.directProbeMu.Unlock()
+
+	go func() {
+		time.Sleep(1800 * time.Millisecond)
+		n.mu.RLock()
+		running := n.running
+		h := n.host
+		n.mu.RUnlock()
+		if !running || h == nil {
+			return
+		}
+		if h.Network().Connectedness(pid) != network.Connected {
+			return
+		}
+		if n.hasDirectConnToPeer(pid) {
+			return
+		}
+		short := peerIDStr
+		if len(short) > 16 {
+			short = short[:16]
+		}
+		fmt.Printf("p2pmobile: [probe] relay-only to %s — parallel direct dial\n", short)
+		_ = n.tryDialPeerDirect(pid)
+	}()
+}
+
 // ConnectedPeerCount returns the number of connected peers.
 func (n *Node) ConnectedPeerCount() int {
 	n.mu.RLock()
@@ -1153,7 +1228,7 @@ func (n *Node) sendDirectFrames(targetPeerID string, frames [][]byte) error {
 	if negotiated == OptimizedDMProtocol {
 		ps := &pooledStream{
 			stream:  s,
-			writer:  bufio.NewWriterSize(s, 256*1024),
+			writer:  bufio.NewWriterSize(s, dmWriterBufferSize),
 			lastUse: time.Now(),
 		}
 		n.putPooledStream(targetPeerID, ps)
@@ -1254,14 +1329,19 @@ func (n *Node) IsConnectedToPeer(targetPeerID string) bool {
 
 // -------- internal --------
 
-func (n *Node) dialPeer(pid peer.ID) error {
+// tryDialPeerDirect uses peerstore + DHT only (no circuit relay). True if a non-relay conn exists after.
+func (n *Node) tryDialPeerDirect(pid peer.ID) bool {
 	h := n.host
 	if h == nil {
-		return fmt.Errorf("not started")
+		return false
 	}
-	pidShort := pid.String()[:16]
-
-	// ── Step 1: Try direct with peerstore addrs (may include IPv6 from identify) ──
+	pidShort := pid.String()
+	if len(pidShort) > 16 {
+		pidShort = pidShort[:16]
+	}
+	if n.hasDirectConnToPeer(pid) {
+		return true
+	}
 	if addrs := h.Peerstore().Addrs(pid); len(addrs) > 0 {
 		var directAddrs []multiaddr.Multiaddr
 		for _, a := range addrs {
@@ -1275,17 +1355,17 @@ func (n *Node) dialPeer(pid peer.ID) error {
 			err := h.Connect(ctx, peer.AddrInfo{ID: pid, Addrs: directAddrs})
 			cancel()
 			if err == nil {
-				conn := h.Network().ConnsToPeer(pid)
-				if len(conn) > 0 {
-					fmt.Printf("p2pmobile: [dial] step1 DIRECT connected to %s via %s\n", pidShort, conn[0].RemoteMultiaddr())
+				if conns := h.Network().ConnsToPeer(pid); len(conns) > 0 {
+					fmt.Printf("p2pmobile: [dial] step1 connected to %s via %s\n", pidShort, conns[0].RemoteMultiaddr())
 				}
-				return nil
+			} else {
+				fmt.Printf("p2pmobile: [dial] step1 direct dial failed for %s: %v\n", pidShort, err)
 			}
-			fmt.Printf("p2pmobile: [dial] step1 direct dial failed for %s: %v\n", pidShort, err)
+			if n.hasDirectConnToPeer(pid) {
+				return true
+			}
 		}
 	}
-
-	// ── Step 2: DHT FindPeer — discovers peer's IPv6 + all public addrs ──
 	n.mu.RLock()
 	d := n.dht
 	n.mu.RUnlock()
@@ -1295,7 +1375,6 @@ func (n *Node) dialPeer(pid peer.ID) error {
 		peerInfo, err := d.FindPeer(ctx, pid)
 		cancel()
 		if err == nil && len(peerInfo.Addrs) > 0 {
-			// Filter to direct (non-relay) addresses, prefer IPv6
 			var directAddrs, ipv6Addrs []multiaddr.Multiaddr
 			for _, a := range peerInfo.Addrs {
 				aStr := a.String()
@@ -1309,43 +1388,50 @@ func (n *Node) dialPeer(pid peer.ID) error {
 			}
 			fmt.Printf("p2pmobile: [dial] step2 DHT found %d addrs (%d IPv6) for %s: %v\n",
 				len(directAddrs), len(ipv6Addrs), pidShort, directAddrs)
-
-			// Try IPv6 first (most likely to succeed on 4G/5G)
 			if len(ipv6Addrs) > 0 {
 				fmt.Printf("p2pmobile: [dial] step2a trying IPv6 direct to %s: %v\n", pidShort, ipv6Addrs)
 				ctx2, cancel2 := context.WithTimeout(n.ctx, 5*time.Second)
 				err2 := h.Connect(ctx2, peer.AddrInfo{ID: pid, Addrs: ipv6Addrs})
 				cancel2()
 				if err2 == nil {
-					conn := h.Network().ConnsToPeer(pid)
-					if len(conn) > 0 {
-						fmt.Printf("p2pmobile: [dial] step2a IPv6 DIRECT connected to %s via %s\n", pidShort, conn[0].RemoteMultiaddr())
+					if conns := h.Network().ConnsToPeer(pid); len(conns) > 0 {
+						fmt.Printf("p2pmobile: [dial] step2a IPv6 connected to %s via %s\n", pidShort, conns[0].RemoteMultiaddr())
 					}
-					return nil
+				} else {
+					fmt.Printf("p2pmobile: [dial] step2a IPv6 direct failed for %s: %v\n", pidShort, err2)
 				}
-				fmt.Printf("p2pmobile: [dial] step2a IPv6 direct failed for %s: %v\n", pidShort, err2)
+				if n.hasDirectConnToPeer(pid) {
+					return true
+				}
 			}
-
-			// Try all direct addrs (IPv4 + IPv6)
 			if len(directAddrs) > 0 {
 				ctx3, cancel3 := context.WithTimeout(n.ctx, 5*time.Second)
 				err3 := h.Connect(ctx3, peer.AddrInfo{ID: pid, Addrs: directAddrs})
 				cancel3()
 				if err3 == nil {
-					conn := h.Network().ConnsToPeer(pid)
-					if len(conn) > 0 {
-						fmt.Printf("p2pmobile: [dial] step2b DIRECT connected to %s via %s\n", pidShort, conn[0].RemoteMultiaddr())
+					if conns := h.Network().ConnsToPeer(pid); len(conns) > 0 {
+						fmt.Printf("p2pmobile: [dial] step2b connected to %s via %s\n", pidShort, conns[0].RemoteMultiaddr())
 					}
-					return nil
+				} else {
+					fmt.Printf("p2pmobile: [dial] step2b direct dial failed for %s: %v\n", pidShort, err3)
 				}
-				fmt.Printf("p2pmobile: [dial] step2b direct dial failed for %s: %v\n", pidShort, err3)
+				if n.hasDirectConnToPeer(pid) {
+					return true
+				}
 			}
 		} else {
 			fmt.Printf("p2pmobile: [dial] step2 DHT FindPeer failed for %s: %v\n", pidShort, err)
 		}
 	}
+	return n.hasDirectConnToPeer(pid)
+}
 
-	// ── Step 3: Relay fallback (last resort) ──
+func (n *Node) dialPeerRelayFallback(pid peer.ID) error {
+	h := n.host
+	if h == nil {
+		return fmt.Errorf("not started")
+	}
+	pidShort := pid.String()[:16]
 	fmt.Printf("p2pmobile: [dial] step3 falling back to RELAY for %s\n", pidShort)
 	for _, bp := range n.bootstrapPeers {
 		relayAddr := fmt.Sprintf("/p2p/%s/p2p-circuit/p2p/%s", bp.ID, pid)
@@ -1365,6 +1451,33 @@ func (n *Node) dialPeer(pid peer.ID) error {
 		fmt.Printf("p2pmobile: [dial] step3 relay failed to %s via %s: %v\n", pidShort, bp.ID, err)
 	}
 	return fmt.Errorf("unreachable: %s", pid)
+}
+
+func (n *Node) dialPeer(pid peer.ID) error {
+	h := n.host
+	if h == nil {
+		return fmt.Errorf("not started")
+	}
+	pidShort := pid.String()[:16]
+	if h.Network().Connectedness(pid) == network.Connected && n.hasDirectConnToPeer(pid) {
+		return nil
+	}
+	for pass := 0; pass < directDialPasses; pass++ {
+		if pass > 0 {
+			j := 80 + rand.Intn(220)
+			time.Sleep(time.Duration(j) * time.Millisecond)
+			fmt.Printf("p2pmobile: [dial] direct pass %d/%d jitter=%dms peer=%s\n", pass+1, directDialPasses, j, pidShort)
+		}
+		if n.tryDialPeerDirect(pid) {
+			fmt.Printf("p2pmobile: [dial] direct OK (pass %d) peer=%s\n", pass+1, pidShort)
+			return nil
+		}
+	}
+	if h.Network().Connectedness(pid) == network.Connected {
+		// Already reachable (e.g. relay from earlier); no need to relay-dial again.
+		return nil
+	}
+	return n.dialPeerRelayFallback(pid)
 }
 
 func (n *Node) handleDirectStream(s network.Stream) {
@@ -1420,7 +1533,7 @@ func (n *Node) handleDirectStream(s network.Stream) {
 
 func loadOrCreateIdentity(dataDir string) (crypto.PrivKey, error) {
 	if dataDir == "" {
-		priv, _, err := crypto.GenerateEd25519Key(rand.Reader)
+		priv, _, err := crypto.GenerateEd25519Key(crand.Reader)
 		return priv, err
 	}
 	keyPath := filepath.Join(dataDir, identityKeyFile)
@@ -1437,7 +1550,7 @@ func loadOrCreateIdentity(dataDir string) (crypto.PrivKey, error) {
 		}
 	}
 	seed := make([]byte, ed25519.SeedSize)
-	if _, err := rand.Read(seed); err != nil {
+	if _, err := crand.Read(seed); err != nil {
 		return nil, err
 	}
 	if err := os.MkdirAll(dataDir, 0700); err != nil {
@@ -1717,7 +1830,18 @@ func (n *Node) OnNetworkChanged() {
 	p2pDebugf("p2pmobile: [netchange] evicted %d pooled streams\n", poolCount)
 	n.clearIngressBudgets()
 
-	// 3. Close stale connections to non-bootstrap peers (their addrs are now wrong for us)
+	// 3. Reconnect bootstrap first (control plane) on the new link before tearing mesh.
+	n.ensureBootstrap()
+
+	// 4. Re-discover real addresses from the new bootstrap TCP local addr
+	n.discoverRealAddrs()
+
+	// 5. Re-reserve relay + advertised circuit addrs (reservation tied to bootstrap conn)
+	n.reserveRelayOnBootstrap()
+	n.addRelayCircuitAddrs()
+
+	// 6. Stagger ClosePeer for non-bootstrap peers (avoids thundering herd; sockets are stale anyway)
+	var toClose []peer.ID
 	for _, p := range h.Network().Peers() {
 		isBootstrap := false
 		for _, bp := range n.bootstrapPeers {
@@ -1727,21 +1851,17 @@ func (n *Node) OnNetworkChanged() {
 			}
 		}
 		if !isBootstrap {
-			_ = h.Network().ClosePeer(p)
+			toClose = append(toClose, p)
+		}
+	}
+	for i, p := range toClose {
+		_ = h.Network().ClosePeer(p)
+		if i+1 < len(toClose) {
+			time.Sleep(25 * time.Millisecond)
 		}
 	}
 
-	// 4. Reconnect to bootstrap (new network → new TCP connection → new local addr)
-	n.ensureBootstrap()
-
-	// 5. Re-discover real addresses from the new bootstrap connection
-	n.discoverRealAddrs()
-
-	// 6. Re-reserve relay slot (old reservation used old connection)
-	n.reserveRelayOnBootstrap()
-	n.addRelayCircuitAddrs()
-
-	// 7. Push updated identify to bootstrap so DHT has our fresh addresses.
+	// 7. Push updated identify so remotes learn fresh reachability (DCUtR / hole-punch).
 	// h.Connect already ran identify during ensureBootstrap, but we can also
 	// trigger a push for any currently-connected peer.
 	// SignalAddressChange is on BasicHost, not the Host interface — type-assert.
