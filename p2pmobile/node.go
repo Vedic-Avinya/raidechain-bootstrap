@@ -1,17 +1,19 @@
 // Package p2pmobile provides a gomobile-bindable libp2p node for Android/iOS.
 //
 // Features:
-//   - Hybrid QUIC (UDP) + TCP transports: QUIC first, TCP fallback
+//   - QUIC-first transport: QUIC (UDP) primary, TCP fallback
 //   - GossipSub topic pub/sub (backward-compat with existing chat)
 //   - Direct peer-to-peer streams (no relay needed when NAT allows)
 //   - DHT peer discovery
-//   - NAT traversal: port mapping, hole punching, circuit relay v2 fallback
+//   - NAT traversal: UPnP port mapping, DCUtR hole punching, circuit relay v2 fallback
 //
-// Hybrid Transport Strategy:
-//   - Listen on QUIC (UDP) + TCP for both IPv4 and IPv6
-//   - QUIC preferred for lower latency and better mobile performance
-//   - TCP fallback for NAT/unreachable scenarios
-//   - Bootstrap always uses TCP for reliability
+// Transport Strategy:
+//   - QUIC registered before TCP so the dialer prefers UDP
+//   - QUIC-strict bootstrap dial: peerstore is temporarily narrowed to
+//     UDP-only addrs so libp2p cannot silently fall back to TCP
+//   - Private/CGNAT UDP addresses are advertised (not stripped) so that
+//     DCUtR hole punching can coordinate NAT traversal via the relay
+//   - TCP fallback for networks that block all UDP
 //
 // Build AAR:
 //
@@ -46,8 +48,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
+	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/protocol"
-	basichost "github.com/libp2p/go-libp2p/p2p/host/basic"
 	circuitv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
 	libp2pquic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
@@ -161,6 +163,7 @@ func NewNode() *Node {
 		subs:            make(map[string]*pubsub.Subscription),
 		streamPool:      make(map[string]*pooledStream),
 		directProbeLast: make(map[string]time.Time),
+		ingressBudget:   make(map[string]*peerIngressBudget),
 	}
 }
 
@@ -179,8 +182,8 @@ func NewNode() *Node {
 // bootstrapMultiaddrs: comma-separated multiaddrs of the bootstrap node.
 func (n *Node) Start(dataDir string, bootstrapMultiaddrs string) error {
 	n.mu.Lock()
-	defer n.mu.Unlock()
 	if n.running {
+		n.mu.Unlock()
 		return nil
 	}
 
@@ -188,37 +191,42 @@ func (n *Node) Start(dataDir string, bootstrapMultiaddrs string) error {
 
 	priv, err := loadOrCreateIdentity(dataDir)
 	if err != nil {
+		n.mu.Unlock()
 		return fmt.Errorf("identity: %w", err)
 	}
 
 	bootstrapInfos := parseBootstrapAddrs(bootstrapMultiaddrs)
 	n.bootstrapPeers = bootstrapInfos
 
-	// ── Phase 1: Create host with OPTIMIZED transports for mobile ──────
-	// Mobile networks behind CGNAT: QUIC has high latency or fails.
-	// TCP is reliable and works through CGNAT.
-	//
-	// Strategy:
-	//   - TCP with UDP fallback (not QUIC first)
-	//   - Connection-oriented: reliable for messaging
-	//   - Works through CGNAT and firewalls
+	// ── Phase 1: Create host with QUIC-first transports ─────────────────
+	// QUIC (UDP) is preferred: lower latency, 0-RTT resume, better mobile
+	// handover.  TCP is the reliable fallback for networks that block UDP.
+	// Transport registration order sets dialer priority: QUIC first.
 	h, err := libp2p.New(
 		libp2p.Identity(priv),
-		// TCP primary - works reliably on mobile CGNAT
-		// Note: libp2p will still try UDP/QUIC internally, but TCP is preferred
-		libp2p.Transport(tcp.NewTCPTransport),
-		// Also listen on UDP for cases where UDP is not blocked
+		// QUIC first — lower latency, better for mobile, enables DCUtR hole-punching
 		libp2p.Transport(libp2pquic.NewTransport),
-		// Listen on multiple ports
+		// TCP fallback — reliable through strict CGNAT / UDP-blocking networks
+		libp2p.Transport(tcp.NewTCPTransport),
+		// Listen on QUIC (UDP) + TCP for both IPv4 and IPv6
 		libp2p.ListenAddrStrings(
-			"/ip4/0.0.0.0/tcp/0",         // TCP primary (CGNAT friendly)
-			"/ip6/::/tcp/0",              // IPv6 TCP
-			"/ip4/0.0.0.0/udp/0/quic-v1", // UDP fallback for local/private networks
-			"/ip6/::/udp/0/quic-v1",
+			"/ip4/0.0.0.0/udp/0/quic-v1", // QUIC IPv4 — primary
+			"/ip6/::/udp/0/quic-v1",       // QUIC IPv6
+			"/ip4/0.0.0.0/tcp/0",          // TCP IPv4 — fallback
+			"/ip6/::/tcp/0",               // TCP IPv6
 		),
-		// Enable Relay (Circuit v2) and Hole Punching for NAT traversal
+		// NAT traversal: UPnP port mapping, relay v2, DCUtR hole punching
+		libp2p.NATPortMap(),
 		libp2p.EnableRelay(),
 		libp2p.EnableHolePunching(),
+		// Mobile nodes are ALWAYS behind NAT — skip AutoNAT probing delay.
+		// Without this, libp2p waits for AutoNAT probes (which often fail on
+		// mobile CGNAT) before activating DCUtR and relay reservation.
+		libp2p.ForceReachabilityPrivate(),
+		// AutoRelay with bootstrap as static relays — properly integrates relay
+		// management with the identify/dcutr pipeline.  Automatically reserves
+		// slots, advertises relay addrs via identify, and re-reserves on expiry.
+		libp2p.EnableAutoRelayWithStaticRelays(bootstrapInfos),
 		// Custom address factory to inject externally discovered addresses
 		libp2p.AddrsFactory(func(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr {
 			n.extraAddrsMu.RLock()
@@ -232,6 +240,7 @@ func (n *Node) Start(dataDir string, bootstrapMultiaddrs string) error {
 		}),
 	)
 	if err != nil {
+		n.mu.Unlock()
 		return fmt.Errorf("host: %w", err)
 	}
 	n.host = h
@@ -289,34 +298,48 @@ func (n *Node) Start(dataDir string, bootstrapMultiaddrs string) error {
 						fmt.Printf("p2pmobile: [auto-reconnect] bootstrap peer %s lost — reconnecting immediately\n", remotePeer[:16])
 						go func(pi peer.AddrInfo) {
 							time.Sleep(2 * time.Second) // brief backoff
-							// QUIC-first with TCP fallback
+							hh := n.host
+							if hh == nil {
+								return
+							}
+							// QUIC-strict: isolate peerstore
 							quicInfo := quicOnlyPeerInfo(pi)
 							if len(quicInfo.Addrs) > 0 {
-								ctx, cancel := context.WithTimeout(n.ctx, 30*time.Second)
-								err := n.host.Connect(ctx, quicInfo)
+								allAddrs := hh.Peerstore().Addrs(pi.ID)
+								hh.Peerstore().ClearAddrs(pi.ID)
+								hh.Peerstore().AddAddrs(pi.ID, quicInfo.Addrs, peerstore.TempAddrTTL)
+
+								ctx, cancel := context.WithTimeout(n.ctx, 8*time.Second)
+								err := hh.Connect(ctx, quicInfo)
 								cancel()
+
+								hh.Peerstore().ClearAddrs(pi.ID)
+								hh.Peerstore().AddAddrs(pi.ID, allAddrs, peerstore.PermanentAddrTTL)
+
 								if err == nil {
-									fmt.Printf("p2pmobile: [auto-reconnect] QUIC reconnected %s\n", pi.ID.String()[:16])
+									transport := actualConnTransport(hh, pi.ID)
+									fmt.Printf("p2pmobile: [auto-reconnect] reconnected %s via %s\n", pi.ID.String()[:16], transport)
 									n.discoverRealAddrs()
 									n.reserveRelayOnBootstrap()
 									n.addRelayCircuitAddrs()
 									return
 								}
-								fmt.Printf("p2pmobile: [auto-reconnect] QUIC failed %s: %v\n", pi.ID.String()[:16], err)
+								fmt.Printf("p2pmobile: [auto-reconnect] QUIC-strict failed %s: %v\n", pi.ID.String()[:16], err)
 							}
-							// Fallback to TCP
+							// TCP fallback
 							tcpInfo := tcpOnlyPeerInfo(pi)
 							if len(tcpInfo.Addrs) == 0 {
 								tcpInfo = pi
 							}
-							ctx, cancel := context.WithTimeout(n.ctx, 30*time.Second)
-							err := n.host.Connect(ctx, tcpInfo)
+							ctx, cancel := context.WithTimeout(n.ctx, 10*time.Second)
+							err := hh.Connect(ctx, tcpInfo)
 							cancel()
 							if err != nil {
 								fmt.Printf("p2pmobile: [auto-reconnect] FAILED %s: %v\n", pi.ID.String()[:16], err)
 								return
 							}
-							fmt.Printf("p2pmobile: [auto-reconnect] reconnected %s\n", pi.ID.String()[:16])
+							transport := actualConnTransport(hh, pi.ID)
+							fmt.Printf("p2pmobile: [auto-reconnect] reconnected %s via %s\n", pi.ID.String()[:16], transport)
 							n.discoverRealAddrs()
 							n.reserveRelayOnBootstrap()
 							n.addRelayCircuitAddrs()
@@ -328,10 +351,9 @@ func (n *Node) Start(dataDir string, bootstrapMultiaddrs string) error {
 		},
 	})
 
-	// ── Phase 2: Bootstrap in BACKGROUND ──────────────────────────────────
-	// DO NOT block Start() on bootstrap connection.
-	// Initialize GossipSub first so node is usable immediately.
+	// ── Phase 2: GossipSub (instant) ─────────────────────────────────────
 	if err := n.initGossipSubAndReady(h); err != nil {
+		n.mu.Unlock()
 		return err
 	}
 
@@ -341,8 +363,15 @@ func (n *Node) Start(dataDir string, bootstrapMultiaddrs string) error {
 		h.ConnManager().Protect(info.ID, "bootstrap")
 	}
 
-	// Start bootstrap in background - returns immediately
-	go n.bootstrapWithRetry()
+	// Release write lock before blocking bootstrap — ensureBootstrap()
+	// needs RLock, and network callbacks also need RLock.
+	n.mu.Unlock()
+
+	// ── Phase 2b: Background bootstrap + upgrade ────────────────────────
+	// Bootstrap MUST be async — synchronous blocks the JNI thread for up
+	// to 90s (QUIC 8s + TCP 10s × 5 retries) causing ANR on Android.
+	// Kotlin polls connectedPeerCount() with cooperative delay() instead.
+	go n.backgroundUpgrade()
 
 	return nil
 }
@@ -381,60 +410,77 @@ func (n *Node) bootstrapWithRetry() {
 				return
 			}
 
-			// TCP-first: CGNAT mobile networks block incoming UDP, so TCP works but QUIC doesn't
-			// QUIC is tried with short timeout in case UDP happens to work
+			// ── QUIC-strict dial (with retry) ────────────────────────────
+			// h.Connect dials ALL addrs in the peerstore for the peer, not
+			// just the ones in AddrInfo.  To enforce a genuine QUIC-only
+			// attempt we must temporarily remove TCP addrs from the store.
+			//
+			// quic-go's internal HandshakeIdleTimeout is ~5s.  A single
+			// attempt gives up too quickly on high-latency mobile networks.
+			// Two attempts give ~10s of genuine QUIC dialing before TCP.
+			quicInfo := quicOnlyPeerInfo(info)
+			quicConnected := false
+			if len(quicInfo.Addrs) > 0 {
+				allAddrs := h.Peerstore().Addrs(info.ID)
+				t0 := time.Now()
 
-			// Try TCP first (faster on CGNAT networks)
+				for qi := 1; qi <= 2; qi++ {
+					h.Peerstore().ClearAddrs(info.ID)
+					h.Peerstore().AddAddrs(info.ID, quicInfo.Addrs, peerstore.TempAddrTTL)
+
+					fmt.Printf("p2pmobile: [bootstrap] QUIC-strict attempt %d/2 %s addrs=%v\n", qi, info.ID, quicInfo.Addrs)
+					ctxQ, cancelQ := context.WithTimeout(ctx, 8*time.Second)
+					err := h.Connect(ctxQ, quicInfo)
+					cancelQ()
+
+					if err == nil {
+						quicConnected = true
+						break
+					}
+					fmt.Printf("p2pmobile: [bootstrap] QUIC-strict %d/2 failed %s after %v: %v\n",
+						qi, info.ID, time.Since(t0).Round(time.Millisecond), err)
+				}
+
+				// Restore full address set (TCP + QUIC) regardless of outcome
+				h.Peerstore().ClearAddrs(info.ID)
+				h.Peerstore().AddAddrs(info.ID, allAddrs, peerstore.PermanentAddrTTL)
+
+				if quicConnected {
+					transport := actualConnTransport(h, info.ID)
+					addr := actualConnAddr(h, info.ID)
+					fmt.Printf("p2pmobile: [bootstrap] ✓ connected to %s in %v via %s addr=%s\n",
+						info.ID, time.Since(t0).Round(time.Millisecond), transport, addr)
+					bootstrapConnected = true
+					n.discoverRealAddrs()
+					n.reserveRelayOnBootstrap()
+					n.addRelayCircuitAddrs()
+					break
+				}
+				fmt.Printf("p2pmobile: [bootstrap] QUIC-strict exhausted for %s after %v, trying TCP...\n",
+					info.ID, time.Since(t0).Round(time.Millisecond))
+			}
+
+			// ── TCP fallback ────────────────────────────────────────────
 			tcpInfo := tcpOnlyPeerInfo(info)
 			if len(tcpInfo.Addrs) == 0 {
 				tcpInfo = info
 			}
-			fmt.Printf("p2pmobile: [bootstrap] trying TCP %s addrs=%v\n", tcpInfo.ID, tcpInfo.Addrs)
 			t0 := time.Now()
-			ctx10, cancel := context.WithTimeout(ctx, 10*time.Second)
-			err := h.Connect(ctx10, tcpInfo)
-			cancel()
+			ctx10b, cancel2 := context.WithTimeout(ctx, 10*time.Second)
+			err := h.Connect(ctx10b, tcpInfo)
+			cancel2()
 
-			connectedInfo := tcpInfo
 			if err != nil {
-				fmt.Printf("p2pmobile: [bootstrap] TCP failed %s after %v: %v, trying QUIC...\n",
-					tcpInfo.ID, time.Since(t0).Round(time.Millisecond), err)
-
-				// Fall back to QUIC with short timeout (in case UDP works)
-				quicInfo := quicOnlyPeerInfo(info)
-				if len(quicInfo.Addrs) == 0 {
-					quicInfo = info
-				}
-				t0 = time.Now()
-				ctx3, cancel2 := context.WithTimeout(ctx, 3*time.Second)
-				err = h.Connect(ctx3, quicInfo)
-				cancel2()
-				connectedInfo = quicInfo
-
-				if err != nil {
-					fmt.Printf("p2pmobile: [bootstrap] QUIC also failed %s after %v: %v\n",
-						quicInfo.ID, time.Since(t0).Round(time.Millisecond), err)
-					continue
-				}
+				fmt.Printf("p2pmobile: [bootstrap] TCP also failed %s after %v: %v\n",
+					info.ID, time.Since(t0).Round(time.Millisecond), err)
+				continue
 			}
 
-			// Connected!
-			fmt.Printf("p2pmobile: [bootstrap] ✓ connected to %s in %v via %s\n",
-				connectedInfo.ID, time.Since(t0).Round(time.Millisecond),
-				func() string {
-					if strings.Contains(connectedInfo.Addrs[0].String(), "/quic") {
-						return "QUIC"
-					}
-					return "TCP"
-				}())
+			transport := actualConnTransport(h, info.ID)
+			addr := actualConnAddr(h, info.ID)
+			fmt.Printf("p2pmobile: [bootstrap] ✓ connected to %s in %v via %s addr=%s\n",
+				info.ID, time.Since(t0).Round(time.Millisecond), transport, addr)
 			bootstrapConnected = true
-
-			// Notify connection handler
-			if ch := n.connHandler; ch != nil {
-				ch.OnPeerConnected(connectedInfo.ID.String())
-			}
-
-			// Trigger address discovery and relay reservation
 			n.discoverRealAddrs()
 			n.reserveRelayOnBootstrap()
 			n.addRelayCircuitAddrs()
@@ -465,24 +511,39 @@ func (n *Node) initGossipSubAndReady(h host.Host) error {
 	n.ps = ps
 
 	n.running = true
-	// Log all listen addresses with transport type
+	// Log all listen addresses with transport type and extract actual ports
 	var quicListeners, tcpListeners int
+	var quicPort, tcpPort string
 	for _, addr := range h.Addrs() {
+		aStr := addr.String()
 		transport := "TCP"
-		if strings.Contains(addr.String(), "/udp/") {
+		if strings.Contains(aStr, "/udp/") {
 			transport = "QUIC"
 			quicListeners++
+			// Extract QUIC port for diagnostic logging
+			parts := strings.Split(aStr, "/")
+			for i, p := range parts {
+				if p == "udp" && i+1 < len(parts) {
+					quicPort = parts[i+1]
+				}
+			}
 		} else {
 			tcpListeners++
+			parts := strings.Split(aStr, "/")
+			for i, p := range parts {
+				if p == "tcp" && i+1 < len(parts) {
+					tcpPort = parts[i+1]
+				}
+			}
 		}
 		fmt.Printf("p2pmobile: LISTEN addr=%s transport=%s\n", addr, transport)
 	}
-	fmt.Printf("p2pmobile: node READY — peerID=%s listeners={QUIC:%d TCP:%d}\n",
-		h.ID(), quicListeners, tcpListeners)
+	fmt.Printf("p2pmobile: node READY — peerID=%s listeners={QUIC:%d TCP:%d} ports={QUIC:%s TCP:%s}\n",
+		h.ID(), quicListeners, tcpListeners, quicPort, tcpPort)
+	fmt.Printf("p2pmobile: NAT config — ForceReachabilityPrivate=true AutoRelay=static HolePunching=true NATPortMap=true\n")
 
-	// ── Phase 4: Background upgrade ──────────────────────────────────
-	go n.backgroundUpgrade()
-
+	// Phase 4 (backgroundUpgrade) is launched by Start() AFTER synchronous
+	// bootstrap, to avoid racing on peerstore during QUIC-strict dials.
 	return nil
 }
 
@@ -547,6 +608,27 @@ func parseBootstrapAddrs(raw string) []peer.AddrInfo {
 		out = append(out, *info)
 	}
 	return out
+}
+
+// actualConnTransport inspects the real connection to a peer and returns
+// the transport string ("QUIC" or "TCP") based on the actual multiaddr,
+// NOT the AddrInfo we passed to h.Connect (which libp2p may ignore).
+func actualConnTransport(h host.Host, pid peer.ID) string {
+	for _, c := range h.Network().ConnsToPeer(pid) {
+		if strings.Contains(c.RemoteMultiaddr().String(), "/udp/") {
+			return "QUIC"
+		}
+	}
+	return "TCP"
+}
+
+// actualConnAddr returns the remote multiaddr string of the newest connection.
+func actualConnAddr(h host.Host, pid peer.ID) string {
+	conns := h.Network().ConnsToPeer(pid)
+	if len(conns) == 0 {
+		return "<none>"
+	}
+	return conns[len(conns)-1].RemoteMultiaddr().String()
 }
 
 // tcpOnlyPeerInfo returns a copy of info with only TCP multiaddrs.
@@ -708,24 +790,28 @@ func (n *Node) discoverRealAddrs() {
 				continue
 			}
 
-			// CGNAT/private IPs cannot receive incoming UDP, so skip them for QUIC
+			// IMPORTANT: Do NOT skip QUIC for private/CGNAT IPs!
+			// DCUtR (hole punching) requires knowing the local UDP port so the
+			// relay can coordinate simultaneous UDP sends from both sides of
+			// the NAT.  Stripping private UDP addrs makes hole punching
+			// impossible and forces permanent relay fallback.
 			isCGNAT := ipVersion == "ip4" && isPrivateCGNAT(ipAddr)
 			if isCGNAT {
-				fmt.Printf("p2pmobile: [discover] ⚠ CGNAT IP %s skipped for QUIC (no incoming UDP)\n", ipAddr)
+				fmt.Printf("p2pmobile: [discover] private/CGNAT IP %s — advertising QUIC anyway for DCUtR hole-punching\n", ipAddr)
 			}
 
-			// Add QUIC address only if NOT CGNAT (UDP requires public/routable IP)
-			if quicPort != "" && !isCGNAT {
+			// Add QUIC address (needed for DCUtR even behind CGNAT)
+			if quicPort != "" {
 				realAddr := fmt.Sprintf("/%s/%s/udp/%s/quic-v1", ipVersion, ipAddr, quicPort)
 				ma, err := multiaddr.NewMultiaddr(realAddr)
 				if err == nil {
 					n.addExtraAddr(ma)
 					h.Peerstore().AddAddr(h.ID(), ma, peerstore.PermanentAddrTTL)
-					fmt.Printf("p2pmobile: [discover] ✚ QUIC addr discovered: %s\n", realAddr)
+					fmt.Printf("p2pmobile: [discover] ✚ QUIC addr discovered: %s (cgnat=%v)\n", realAddr, isCGNAT)
 				}
 			}
 
-			// Add TCP address (works through CGNAT)
+			// Add TCP address
 			if tcpPort != "" {
 				realAddr := fmt.Sprintf("/%s/%s/tcp/%s", ipVersion, ipAddr, tcpPort)
 				ma, err := multiaddr.NewMultiaddr(realAddr)
@@ -739,8 +825,10 @@ func (n *Node) discoverRealAddrs() {
 	}
 }
 
-// injectPeerQUICAddr extracts the peer's QUIC address from the TCP connection
-// and injects it into the peerstore. This ensures future dials can try QUIC.
+// injectPeerQUICAddr checks if the peer already has QUIC addresses in the
+// peerstore (from identify exchange). If not, it looks for QUIC addrs that
+// identify may have provided with a different IP but valid port, and
+// synthesizes a QUIC addr using the peer's observed TCP IP + their QUIC port.
 // Only works for non-relay, non-bootstrap connections.
 func (n *Node) injectPeerQUICAddr(c network.Conn) {
 	n.mu.RLock()
@@ -759,11 +847,9 @@ func (n *Node) injectPeerQUICAddr(c network.Conn) {
 
 	// Skip bootstrap peers and self
 	if bootstrapIDs[pid] {
-		fmt.Printf("p2pmobile: [peer-quic] skipping bootstrap peer %s\n", pid.String()[:16])
 		return
 	}
 	if pid == selfID {
-		fmt.Printf("p2pmobile: [peer-quic] skipping self %s\n", pid.String()[:16])
 		return
 	}
 
@@ -771,11 +857,10 @@ func (n *Node) injectPeerQUICAddr(c network.Conn) {
 
 	// Skip relay connections
 	if strings.Contains(remoteAddr, "p2p-circuit") {
-		fmt.Printf("p2pmobile: [peer-quic] skipping relay conn to %s\n", pid.String()[:16])
 		return
 	}
 
-	// Extract IP and port from the TCP connection
+	// Extract IP from the TCP connection
 	parts := strings.Split(remoteAddr, "/")
 	var ipVersion, ipAddr string
 	for i, p := range parts {
@@ -786,63 +871,55 @@ func (n *Node) injectPeerQUICAddr(c network.Conn) {
 		}
 	}
 	if ipAddr == "" {
-		fmt.Printf("p2pmobile: [peer-quic] failed to extract IP from %s\n", remoteAddr)
 		return
 	}
 
-	// Get our QUIC listen port for the same IP version
-	quicPort := ""
-	for _, la := range h.Network().ListenAddresses() {
-		laStr := la.String()
-		if !strings.Contains(laStr, "/quic") {
+	pidShort := pid.String()
+	if len(pidShort) > 16 {
+		pidShort = pidShort[:16]
+	}
+
+	// Check peerstore (populated by identify) for the peer's QUIC addresses.
+	// If the peer already has a QUIC addr with this exact IP, we're done.
+	existingAddrs := h.Peerstore().Addrs(pid)
+	var peerQUICPort string
+	for _, a := range existingAddrs {
+		aStr := a.String()
+		if !strings.Contains(aStr, "/quic") {
 			continue
 		}
-		if (ipVersion == "ip6" && strings.Contains(laStr, "/ip6/") && !strings.Contains(laStr, "/ip6/::1")) ||
-			(ipVersion == "ip4" && strings.Contains(laStr, "/ip4/") && !strings.Contains(laStr, "/ip4/127.0.0.1")) {
-			laParts := strings.Split(laStr, "/")
-			for j, p := range laParts {
-				if p == "udp" && j+1 < len(laParts) {
-					quicPort = laParts[j+1]
+		// Already have a QUIC addr with this IP? Nothing to do.
+		if strings.Contains(aStr, "/"+ipVersion+"/"+ipAddr+"/") {
+			fmt.Printf("p2pmobile: [peer-quic] already have QUIC for %s: %s\n", pidShort, aStr)
+			return
+		}
+		// Extract the peer's QUIC port from any of their QUIC addrs (from identify)
+		if peerQUICPort == "" {
+			aParts := strings.Split(aStr, "/")
+			for j, ap := range aParts {
+				if ap == "udp" && j+1 < len(aParts) {
+					peerQUICPort = aParts[j+1]
 					break
 				}
 			}
-			if quicPort != "" {
-				break
-			}
 		}
 	}
-	if quicPort == "" {
-		fmt.Printf("p2pmobile: [peer-quic] no QUIC port for %s from %s\n", ipVersion, remoteAddr)
+
+	if peerQUICPort == "" || peerQUICPort == "0" {
+		fmt.Printf("p2pmobile: [peer-quic] no QUIC port from identify for %s (have %d addrs)\n", pidShort, len(existingAddrs))
 		return
 	}
 
-	// Skip CGNAT/private IPs - they can't receive incoming UDP
-	if ipVersion == "ip4" && isPrivateCGNAT(ipAddr) {
-		fmt.Printf("p2pmobile: [peer-quic] skipping CGNAT IP %s for QUIC inject\n", ipAddr)
-		return
-	}
-
-	// Construct QUIC address
-	quicAddrStr := fmt.Sprintf("/%s/%s/udp/%s/quic-v1", ipVersion, ipAddr, quicPort)
+	// Construct QUIC address using peer's real IP (from TCP conn) + their actual QUIC port (from identify)
+	quicAddrStr := fmt.Sprintf("/%s/%s/udp/%s/quic-v1", ipVersion, ipAddr, peerQUICPort)
 	quicMA, err := multiaddr.NewMultiaddr(quicAddrStr)
 	if err != nil {
-		fmt.Printf("p2pmobile: [peer-quic] failed to construct QUIC addr %s: %v\n", quicAddrStr, err)
 		return
 	}
 
-	// Check if we already have this address
-	existingAddrs := h.Peerstore().Addrs(pid)
-	for _, existing := range existingAddrs {
-		if existing.String() == quicAddrStr {
-			fmt.Printf("p2pmobile: [peer-quic] already have %s for %s\n", quicAddrStr, pid.String()[:16])
-			return
-		}
-	}
-
-	// Add to peerstore so future dials will try QUIC first
 	h.Peerstore().AddAddr(pid, quicMA, peerstore.TempAddrTTL)
-	fmt.Printf("p2pmobile: [peer-quic] ✚ injected QUIC addr for %s: %s (from TCP %s)\n",
-		pid.String()[:16], quicAddrStr, remoteAddr)
+	fmt.Printf("p2pmobile: [peer-quic] ✚ injected QUIC addr for %s: %s (peer port from identify, IP from TCP %s)\n",
+		pidShort, quicAddrStr, remoteAddr)
 }
 
 // provideAddrsToDHT explicitly announces our addresses via the routing system.
@@ -994,31 +1071,41 @@ func (n *Node) ensureBootstrap() {
 			}
 		}
 		for _, info := range bootstrapInfos {
-			// Hybrid: Try QUIC first, then TCP
+			// QUIC-strict: isolate peerstore so h.Connect cannot silently use TCP
 			quicInfo := quicOnlyPeerInfo(info)
 			if len(quicInfo.Addrs) > 0 {
-				ctx, cancel := context.WithTimeout(n.ctx, 30*time.Second)
+				allAddrs := h.Peerstore().Addrs(info.ID)
+				h.Peerstore().ClearAddrs(info.ID)
+				h.Peerstore().AddAddrs(info.ID, quicInfo.Addrs, peerstore.TempAddrTTL)
+
+				ctx, cancel := context.WithTimeout(n.ctx, 8*time.Second)
 				err := h.Connect(ctx, quicInfo)
 				cancel()
+
+				h.Peerstore().ClearAddrs(info.ID)
+				h.Peerstore().AddAddrs(info.ID, allAddrs, peerstore.PermanentAddrTTL)
+
 				if err == nil {
-					fmt.Printf("p2pmobile: [bg] bootstrap connected %s via QUIC (peers=%d)\n",
-						info.ID, len(h.Network().Peers()))
+					transport := actualConnTransport(h, info.ID)
+					fmt.Printf("p2pmobile: [bg] bootstrap connected %s via %s (peers=%d)\n",
+						info.ID, transport, len(h.Network().Peers()))
 					return
 				}
-				fmt.Printf("p2pmobile: [bg] bootstrap QUIC dial failed %s: %v\n", info.ID, err)
+				fmt.Printf("p2pmobile: [bg] bootstrap QUIC-strict failed %s: %v\n", info.ID, err)
 			}
 
-			// Fallback to TCP
+			// TCP fallback
 			tcpInfo := tcpOnlyPeerInfo(info)
 			if len(tcpInfo.Addrs) == 0 {
 				tcpInfo = info
 			}
-			ctx, cancel := context.WithTimeout(n.ctx, 30*time.Second)
+			ctx, cancel := context.WithTimeout(n.ctx, 10*time.Second)
 			err := h.Connect(ctx, tcpInfo)
 			cancel()
 			if err == nil {
-				fmt.Printf("p2pmobile: [bg] bootstrap connected %s via TCP (peers=%d)\n",
-					info.ID, len(h.Network().Peers()))
+				transport := actualConnTransport(h, info.ID)
+				fmt.Printf("p2pmobile: [bg] bootstrap connected %s via %s (peers=%d)\n",
+					info.ID, transport, len(h.Network().Peers()))
 				return
 			}
 			fmt.Printf("p2pmobile: [bg] bootstrap TCP dial failed %s: %v\n", info.ID, err)
@@ -1055,17 +1142,26 @@ func (n *Node) keepAlive() {
 				if h.Network().Connectedness(info.ID) == network.Connected {
 					continue
 				}
-				fmt.Printf("p2pmobile: [keepalive] %s disconnected, reconnecting (QUIC-first)...\n", info.ID)
+				fmt.Printf("p2pmobile: [keepalive] %s disconnected, reconnecting (QUIC-strict first)...\n", info.ID)
 
-				// Hybrid: Try QUIC first, then TCP
+				// QUIC-strict: isolate peerstore
 				quicInfo := quicOnlyPeerInfo(info)
 				if len(quicInfo.Addrs) > 0 {
-					ctx, cancel := context.WithTimeout(n.ctx, 30*time.Second)
+					allAddrs := h.Peerstore().Addrs(info.ID)
+					h.Peerstore().ClearAddrs(info.ID)
+					h.Peerstore().AddAddrs(info.ID, quicInfo.Addrs, peerstore.TempAddrTTL)
+
+					ctx, cancel := context.WithTimeout(n.ctx, 8*time.Second)
 					err := h.Connect(ctx, quicInfo)
 					cancel()
+
+					h.Peerstore().ClearAddrs(info.ID)
+					h.Peerstore().AddAddrs(info.ID, allAddrs, peerstore.PermanentAddrTTL)
+
 					if err == nil {
-						fmt.Printf("p2pmobile: [keepalive] QUIC reconnected %s (peers=%d)\n",
-							info.ID, len(h.Network().Peers()))
+						transport := actualConnTransport(h, info.ID)
+						fmt.Printf("p2pmobile: [keepalive] reconnected %s via %s (peers=%d)\n",
+							info.ID, transport, len(h.Network().Peers()))
 						go func() {
 							n.discoverRealAddrs()
 							n.reserveRelayOnBootstrap()
@@ -1073,24 +1169,24 @@ func (n *Node) keepAlive() {
 						}()
 						continue
 					}
-					fmt.Printf("p2pmobile: [keepalive] QUIC reconnect failed %s: %v\n", info.ID, err)
+					fmt.Printf("p2pmobile: [keepalive] QUIC-strict failed %s: %v\n", info.ID, err)
 				}
 
-				// Fallback to TCP
+				// TCP fallback
 				tcpInfo := tcpOnlyPeerInfo(info)
 				if len(tcpInfo.Addrs) == 0 {
 					tcpInfo = info
 				}
-				ctx, cancel := context.WithTimeout(n.ctx, 30*time.Second)
+				ctx, cancel := context.WithTimeout(n.ctx, 10*time.Second)
 				err := h.Connect(ctx, tcpInfo)
 				cancel()
 				if err != nil {
 					fmt.Printf("p2pmobile: [keepalive] TCP reconnect FAILED %s: %v\n", info.ID, err)
 					continue
 				}
-				fmt.Printf("p2pmobile: [keepalive] TCP reconnected %s (peers=%d)\n",
-					info.ID, len(h.Network().Peers()))
-				// Re-discover real addresses and re-reserve relay after reconnect
+				transport := actualConnTransport(h, info.ID)
+				fmt.Printf("p2pmobile: [keepalive] reconnected %s via %s (peers=%d)\n",
+					info.ID, transport, len(h.Network().Peers()))
 				go func() {
 					n.discoverRealAddrs()
 					n.reserveRelayOnBootstrap()
@@ -1131,29 +1227,48 @@ func (n *Node) AddExternalAddr(addrStr string) error {
 	// If port is /tcp/0, replace with actual listen port
 	if strings.Contains(addrStr, "/tcp/0") {
 		isIPv6 := strings.Contains(addrStr, "/ip6/")
-		var listenPort string
+		var tcpPort, quicPort string
 		for _, la := range h.Network().ListenAddresses() {
 			laStr := la.String()
 			matchIP := (isIPv6 && strings.Contains(laStr, "/ip6/")) ||
 				(!isIPv6 && strings.Contains(laStr, "/ip4/"))
-			if matchIP {
-				parts := strings.Split(laStr, "/")
-				for i, p := range parts {
-					if p == "tcp" && i+1 < len(parts) {
-						listenPort = parts[i+1]
-						break
-					}
+			if !matchIP {
+				continue
+			}
+			parts := strings.Split(laStr, "/")
+			for i, p := range parts {
+				if p == "tcp" && i+1 < len(parts) && tcpPort == "" {
+					tcpPort = parts[i+1]
 				}
-				if listenPort != "" {
+				if p == "udp" && i+1 < len(parts) && strings.Contains(laStr, "/quic") && quicPort == "" {
+					quicPort = parts[i+1]
+				}
+			}
+		}
+		if tcpPort == "" || tcpPort == "0" {
+			fmt.Printf("p2pmobile: AddExternalAddr: no TCP listen port found for %s, skipping\n", addrStr)
+			return nil
+		}
+		addrStr = strings.Replace(addrStr, "/tcp/0", "/tcp/"+tcpPort, 1)
+
+		// Also inject the corresponding QUIC address so peers can dial us via UDP.
+		// Without this, only TCP addresses have real IPs; QUIC shows 0.0.0.0.
+		if quicPort != "" && quicPort != "0" {
+			// Extract IP version and address from the multiaddr string
+			parts := strings.Split(addrStr, "/")
+			for i, p := range parts {
+				if (p == "ip4" || p == "ip6") && i+1 < len(parts) {
+					quicAddrStr := fmt.Sprintf("/%s/%s/udp/%s/quic-v1", p, parts[i+1], quicPort)
+					quicMA, err := multiaddr.NewMultiaddr(quicAddrStr)
+					if err == nil {
+						n.addExtraAddr(quicMA)
+						h.Peerstore().AddAddr(h.ID(), quicMA, peerstore.PermanentAddrTTL)
+						fmt.Printf("p2pmobile: external QUIC addr added: %s\n", quicAddrStr)
+					}
 					break
 				}
 			}
 		}
-		if listenPort == "" || listenPort == "0" {
-			fmt.Printf("p2pmobile: AddExternalAddr: no listen port found for %s, skipping\n", addrStr)
-			return nil
-		}
-		addrStr = strings.Replace(addrStr, "/tcp/0", "/tcp/"+listenPort, 1)
 	}
 
 	ma, err := multiaddr.NewMultiaddr(addrStr)
@@ -1166,7 +1281,7 @@ func (n *Node) AddExternalAddr(addrStr string) error {
 	return nil
 }
 
-// Stop shuts down the node.
+// Stop shuts down the node and clears all state so the next Start() is clean.
 func (n *Node) Stop() error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -1174,6 +1289,13 @@ func (n *Node) Stop() error {
 		return nil
 	}
 	n.running = false
+
+	// Cancel context first — stops all background goroutines (keepAlive,
+	// backgroundUpgrade, streamPoolJanitor, bootstrapWithRetry).
+	if n.cancel != nil {
+		n.cancel()
+	}
+
 	for _, sub := range n.subs {
 		sub.Cancel()
 	}
@@ -1182,14 +1304,41 @@ func (n *Node) Stop() error {
 	}
 	n.topics = make(map[string]*pubsub.Topic)
 	n.subs = make(map[string]*pubsub.Subscription)
+
 	if n.dht != nil {
 		n.dht.Close()
+		n.dht = nil
 	}
-	if n.cancel != nil {
-		n.cancel()
+	n.ps = nil
+
+	// Evict all pooled streams (they reference the dying host's connections).
+	n.streamPoolMu.Lock()
+	for pid, ps := range n.streamPool {
+		ps.stream.Reset()
+		delete(n.streamPool, pid)
 	}
+	n.streamPoolMu.Unlock()
+
+	// Clear stale extra addresses (old Wi-Fi/cellular IPs).
+	// Start() → discoverAndInjectRealAddrs() will repopulate with fresh ones.
+	n.extraAddrsMu.Lock()
+	n.extraAddrs = nil
+	n.extraAddrsMu.Unlock()
+
+	// Clear per-peer rate-limit and direct-probe state.
+	n.ingressMu.Lock()
+	n.ingressBudget = make(map[string]*peerIngressBudget)
+	n.ingressMu.Unlock()
+
+	n.directProbeMu.Lock()
+	n.directProbeLast = make(map[string]time.Time)
+	n.directProbeMu.Unlock()
+
+	n.relayReady = false
+
 	if n.host != nil {
 		n.host.Close()
+		n.host = nil
 	}
 	return nil
 }
@@ -1278,8 +1427,8 @@ func (n *Node) isBootstrapPeerID(id peer.ID) bool {
 	return false
 }
 
-// maybeScheduleDirectProbe starts a delayed peerstore+DHT direct dial while a relay path is up.
-// Relay stays connected if the probe fails (reachability, NAT). Debounced per peer.
+// maybeScheduleDirectProbe starts a fast direct upgrade when a relay connection is detected.
+// Uses aggressiveDirectUpgrade for multi-attempt punching. Debounced per peer (10s).
 func (n *Node) maybeScheduleDirectProbe(peerIDStr string) {
 	pid, err := peer.Decode(strings.TrimSpace(peerIDStr))
 	if err != nil {
@@ -1290,7 +1439,7 @@ func (n *Node) maybeScheduleDirectProbe(peerIDStr string) {
 	}
 	n.directProbeMu.Lock()
 	now := time.Now()
-	if t, ok := n.directProbeLast[peerIDStr]; ok && now.Sub(t) < 45*time.Second {
+	if t, ok := n.directProbeLast[peerIDStr]; ok && now.Sub(t) < 10*time.Second {
 		n.directProbeMu.Unlock()
 		return
 	}
@@ -1300,28 +1449,7 @@ func (n *Node) maybeScheduleDirectProbe(peerIDStr string) {
 	n.directProbeLast[peerIDStr] = now
 	n.directProbeMu.Unlock()
 
-	go func() {
-		time.Sleep(1800 * time.Millisecond)
-		n.mu.RLock()
-		running := n.running
-		h := n.host
-		n.mu.RUnlock()
-		if !running || h == nil {
-			return
-		}
-		if h.Network().Connectedness(pid) != network.Connected {
-			return
-		}
-		if n.hasDirectConnToPeer(pid) {
-			return
-		}
-		short := peerIDStr
-		if len(short) > 16 {
-			short = short[:16]
-		}
-		fmt.Printf("p2pmobile: [probe] relay-only to %s — parallel direct dial\n", short)
-		_ = n.tryDialPeerDirect(pid)
-	}()
+	go n.aggressiveDirectUpgrade(pid)
 }
 
 // ConnectedPeerCount returns the number of connected peers.
@@ -1576,6 +1704,21 @@ func (n *Node) sendDirectFrames(targetPeerID string, frames [][]byte) error {
 		}
 	}
 
+	// Upgrade TCP→QUIC: if pooled stream is TCP but a QUIC connection exists, evict
+	// so the next NewStream picks the faster QUIC path.
+	if ps := n.getPooledStream(targetPeerID); ps != nil {
+		ra := ps.stream.Conn().RemoteMultiaddr().String()
+		if !strings.Contains(ra, "/udp/") { // current pool is TCP
+			for _, c := range h.Network().ConnsToPeer(pid) {
+				if strings.Contains(c.RemoteMultiaddr().String(), "/udp/") {
+					fmt.Printf("p2pmobile: [pool] evict TCP stream — QUIC conn available for %s\n", pidShort)
+					n.evictPooledStream(targetPeerID)
+					break
+				}
+			}
+		}
+	}
+
 	// ── Pooled v2 stream ─────────────────────────────────────────────
 	if ps := n.getPooledStream(targetPeerID); ps != nil {
 		var writeErr error
@@ -1738,8 +1881,8 @@ func (n *Node) IsConnectedToPeer(targetPeerID string) bool {
 // -------- internal --------
 
 // tryDialPeerDirect uses peerstore + DHT only (no circuit relay).
-// Hybrid strategy: QUIC (UDP) first, then TCP fallback.
-// Returns true if a direct (non-relay) connection exists after.
+// Strategy: QUIC-strict first (peerstore isolated to prevent relay sneak-in),
+// then TCP fallback. Returns true if a direct (non-relay) connection exists.
 func (n *Node) tryDialPeerDirect(pid peer.ID) bool {
 	h := n.host
 	if h == nil {
@@ -1753,179 +1896,96 @@ func (n *Node) tryDialPeerDirect(pid peer.ID) bool {
 		return true
 	}
 
-	// Step 1: Try addresses from peerstore (QUIC first, then TCP)
-	if addrs := h.Peerstore().Addrs(pid); len(addrs) > 0 {
-		var quicAddrs, tcpAddrs []multiaddr.Multiaddr
-		for _, a := range addrs {
-			if strings.Contains(a.String(), "p2p-circuit") {
-				continue
-			}
-			if strings.Contains(a.String(), "/quic") {
-				quicAddrs = append(quicAddrs, a)
-			} else if strings.Contains(a.String(), "/tcp/") {
-				tcpAddrs = append(tcpAddrs, a)
-			}
-		}
+	// Collect all known direct addresses (peerstore + DHT), split by transport.
+	var quicAddrs, tcpAddrs []multiaddr.Multiaddr
+	seen := make(map[string]bool)
 
-		// Hybrid: Try QUIC first (lower latency)
-		if len(quicAddrs) > 0 {
-			fmt.Printf("p2pmobile: [dial] step1a QUIC (UDP) trying %d addrs for %s: %v\n", len(quicAddrs), pidShort, quicAddrs)
-			ctx, cancel := context.WithTimeout(n.ctx, 5*time.Second)
-			err := h.Connect(ctx, peer.AddrInfo{ID: pid, Addrs: quicAddrs})
-			cancel()
-			if err != nil {
-				fmt.Printf("p2pmobile: [dial] step1a QUIC dial FAILED for %s: %v\n", pidShort, err)
-			} else {
-				conn := h.Network().ConnsToPeer(pid)[0]
-				transport := "TCP"
-				if strings.Contains(conn.RemoteMultiaddr().String(), "/udp/") {
-					transport = "QUIC"
-				}
-				fmt.Printf("p2pmobile: [dial] step1a QUIC connected to %s via %s transport=%s\n", pidShort, conn.RemoteMultiaddr(), transport)
-				if n.hasDirectConnToPeer(pid) {
-					return true
-				}
-			}
-		} else {
-			fmt.Printf("p2pmobile: [dial] step1a NO QUIC addrs in peerstore for %s (have %d TCP)\n", pidShort, len(tcpAddrs))
+	addIfNew := func(a multiaddr.Multiaddr) {
+		aStr := a.String()
+		if strings.Contains(aStr, "p2p-circuit") || seen[aStr] {
+			return
 		}
-
-		// Fallback to TCP
-		if len(tcpAddrs) > 0 {
-			fmt.Printf("p2pmobile: [dial] step1b TCP fallback trying %d addrs for %s: %v\n", len(tcpAddrs), pidShort, tcpAddrs)
-			ctx, cancel := context.WithTimeout(n.ctx, 5*time.Second)
-			err := h.Connect(ctx, peer.AddrInfo{ID: pid, Addrs: tcpAddrs})
-			cancel()
-			if err != nil {
-				fmt.Printf("p2pmobile: [dial] step1b TCP dial FAILED for %s: %v\n", pidShort, err)
-			} else {
-				fmt.Printf("p2pmobile: [dial] step1b TCP connected to %s via %s\n", pidShort, h.Network().ConnsToPeer(pid)[0].RemoteMultiaddr())
-				if n.hasDirectConnToPeer(pid) {
-					return true
-				}
-			}
+		seen[aStr] = true
+		if strings.Contains(aStr, "/quic") {
+			quicAddrs = append(quicAddrs, a)
+		} else if strings.Contains(aStr, "/tcp/") {
+			tcpAddrs = append(tcpAddrs, a)
 		}
-	} else {
-		fmt.Printf("p2pmobile: [dial] step1 NO addrs in peerstore for %s\n", pidShort)
 	}
 
-	// Step 2: DHT lookup, then try QUIC first, then TCP
+	// Source 1: Peerstore
+	for _, a := range h.Peerstore().Addrs(pid) {
+		addIfNew(a)
+	}
+
+	// Source 2: DHT (if available)
 	n.mu.RLock()
 	d := n.dht
 	n.mu.RUnlock()
-
-	// First, check peerstore for existing addresses
-	peerstoreAddrs := h.Peerstore().Addrs(pid)
-	var psQuic, psTcp int
-	for _, a := range peerstoreAddrs {
-		if strings.Contains(a.String(), "/quic") {
-			psQuic++
-		} else {
-			psTcp++
-		}
-	}
-	fmt.Printf("p2pmobile: [dial] peerstore addrs for %s: {QUIC:%d TCP:%d}\n", pidShort, psQuic, psTcp)
-	fmt.Printf("p2pmobile: [dial] peerstore addrs detail: %v\n", peerstoreAddrs)
-
 	if d != nil {
-		fmt.Printf("p2pmobile: [dial] step2 DHT FindPeer for %s\n", pidShort)
-		ctx, cancel := context.WithTimeout(n.ctx, 8*time.Second)
+		ctx, cancel := context.WithTimeout(n.ctx, 5*time.Second)
 		peerInfo, err := d.FindPeer(ctx, pid)
 		cancel()
-		if err == nil && len(peerInfo.Addrs) > 0 {
-			var quicAddrs, tcpAddrs, ipv6QuicAddrs, ipv6TcpAddrs []multiaddr.Multiaddr
+		if err == nil {
 			for _, a := range peerInfo.Addrs {
-				aStr := a.String()
-				if strings.Contains(aStr, "p2p-circuit") {
-					continue
-				}
-				isIPv6 := strings.HasPrefix(aStr, "/ip6/")
-				isQUIC := strings.Contains(aStr, "/quic")
-
-				if isIPv6 && isQUIC {
-					ipv6QuicAddrs = append(ipv6QuicAddrs, a)
-				} else if isIPv6 && !isQUIC {
-					ipv6TcpAddrs = append(ipv6TcpAddrs, a)
-				} else if isQUIC {
-					quicAddrs = append(quicAddrs, a)
-				} else {
-					tcpAddrs = append(tcpAddrs, a)
-				}
-			}
-			fmt.Printf("p2pmobile: [dial] step2 DHT result for %s: {QUIC:%d TCP:%d IPv6-QUIC:%d IPv6-TCP:%d}\n",
-				pidShort, len(quicAddrs), len(tcpAddrs), len(ipv6QuicAddrs), len(ipv6TcpAddrs))
-			fmt.Printf("p2pmobile: [dial] step2 DHT addrs: %v\n", peerInfo.Addrs)
-
-			// Priority: IPv6-QUIC > IPv6-TCP > QUIC > TCP
-			// IPv6 is preferred because many mobile carriers give public IPv6
-			addrPriority := []struct {
-				addrs []multiaddr.Multiaddr
-				name  string
-			}{
-				{ipv6QuicAddrs, "IPv6-QUIC"},
-				{ipv6TcpAddrs, "IPv6-TCP"},
-				{quicAddrs, "QUIC"},
-				{tcpAddrs, "TCP"},
-			}
-
-			// Also check peerstore for QUIC addresses we injected
-			if len(ipv6QuicAddrs) == 0 && len(quicAddrs) == 0 {
-				// No QUIC from DHT, but we might have injected QUIC addresses
-				peerstoreAddrs := h.Peerstore().Addrs(pid)
-				for _, pa := range peerstoreAddrs {
-					paStr := pa.String()
-					if strings.Contains(paStr, "/quic") && !strings.Contains(paStr, "p2p-circuit") {
-						isIPv6 := strings.HasPrefix(paStr, "/ip6/")
-						if isIPv6 {
-							ipv6QuicAddrs = append(ipv6QuicAddrs, pa)
-						} else {
-							quicAddrs = append(quicAddrs, pa)
-						}
-					}
-				}
-				if len(ipv6QuicAddrs) > 0 || len(quicAddrs) > 0 {
-					fmt.Printf("p2pmobile: [dial] step2 found QUIC in peerstore: IPv6-QUIC=%d QUIC=%d\n",
-						len(ipv6QuicAddrs), len(quicAddrs))
-					addrPriority = []struct {
-						addrs []multiaddr.Multiaddr
-						name  string
-					}{
-						{ipv6QuicAddrs, "IPv6-QUIC"},
-						{quicAddrs, "QUIC"},
-						{ipv6TcpAddrs, "IPv6-TCP"},
-						{tcpAddrs, "TCP"},
-					}
-				}
-			}
-
-			for _, p := range addrPriority {
-				if len(p.addrs) == 0 {
-					continue
-				}
-				fmt.Printf("p2pmobile: [dial] step2 trying %s %d addrs for %s: %v\n", p.name, len(p.addrs), pidShort, p.addrs)
-				ctx2, cancel2 := context.WithTimeout(n.ctx, 5*time.Second)
-				err2 := h.Connect(ctx2, peer.AddrInfo{ID: pid, Addrs: p.addrs})
-				cancel2()
-				if err2 != nil {
-					fmt.Printf("p2pmobile: [dial] step2 %s FAILED for %s: %v\n", p.name, pidShort, err2)
-					continue
-				}
-				conn := h.Network().ConnsToPeer(pid)[0]
-				actualTransport := "TCP"
-				if strings.Contains(conn.RemoteMultiaddr().String(), "/udp/") {
-					actualTransport = "QUIC"
-				}
-				fmt.Printf("p2pmobile: [dial] step2 %s connected to %s actual_transport=%s\n", p.name, pidShort, actualTransport)
-				if n.hasDirectConnToPeer(pid) {
-					return true
-				}
+				addIfNew(a)
 			}
 		} else {
-			fmt.Printf("p2pmobile: [dial] step2 DHT FindPeer FAILED for %s: %v\n", pidShort, err)
+			fmt.Printf("p2pmobile: [dial] DHT FindPeer failed for %s: %v\n", pidShort, err)
 		}
-	} else {
-		fmt.Printf("p2pmobile: [dial] step2 DHT not available for %s\n", pidShort)
 	}
+
+	fmt.Printf("p2pmobile: [dial] direct addrs for %s: QUIC=%d TCP=%d\n", pidShort, len(quicAddrs), len(tcpAddrs))
+
+	// Priority order: QUIC first (lower latency, better mobile), then TCP.
+	// For each group, isolate peerstore to ONLY those addrs so h.Connect()
+	// cannot silently fall back to relay circuit addrs in the peerstore.
+	groups := []struct {
+		addrs []multiaddr.Multiaddr
+		name  string
+	}{
+		{quicAddrs, "QUIC"},
+		{tcpAddrs, "TCP"},
+	}
+
+	for _, g := range groups {
+		if len(g.addrs) == 0 {
+			continue
+		}
+		fmt.Printf("p2pmobile: [dial] trying %s %d addrs for %s\n", g.name, len(g.addrs), pidShort)
+
+		// Isolate peerstore: temporarily replace all addrs with ONLY our direct addrs.
+		// This prevents h.Connect from using relay circuit addrs that may be in peerstore.
+		allAddrs := h.Peerstore().Addrs(pid)
+		h.Peerstore().ClearAddrs(pid)
+		h.Peerstore().AddAddrs(pid, g.addrs, peerstore.TempAddrTTL)
+
+		ctx, cancel := context.WithTimeout(n.ctx, 5*time.Second)
+		err := h.Connect(ctx, peer.AddrInfo{ID: pid, Addrs: g.addrs})
+		cancel()
+
+		// Restore full peerstore
+		h.Peerstore().ClearAddrs(pid)
+		h.Peerstore().AddAddrs(pid, allAddrs, peerstore.PermanentAddrTTL)
+		// Also re-add DHT/injected addrs that were collected
+		h.Peerstore().AddAddrs(pid, quicAddrs, peerstore.TempAddrTTL)
+		h.Peerstore().AddAddrs(pid, tcpAddrs, peerstore.TempAddrTTL)
+
+		if err != nil {
+			fmt.Printf("p2pmobile: [dial] %s FAILED for %s: %v\n", g.name, pidShort, err)
+			continue
+		}
+
+		// Verify we got a DIRECT connection (not relay that snuck in)
+		if n.hasDirectConnToPeer(pid) {
+			actual := actualConnTransport(h, pid)
+			addr := actualConnAddr(h, pid)
+			fmt.Printf("p2pmobile: [dial] ✓ DIRECT %s to %s actual=%s addr=%s\n", g.name, pidShort, actual, addr)
+			return true
+		}
+		fmt.Printf("p2pmobile: [dial] %s connected but NOT direct for %s (relay snuck in)\n", g.name, pidShort)
+	}
+
 	return n.hasDirectConnToPeer(pid)
 }
 
@@ -1935,7 +1995,7 @@ func (n *Node) dialPeerRelayFallback(pid peer.ID) error {
 		return fmt.Errorf("not started")
 	}
 	pidShort := pid.String()[:16]
-	fmt.Printf("p2pmobile: [dial] step3 falling back to RELAY for %s\n", pidShort)
+	fmt.Printf("p2pmobile: [dial] falling back to RELAY for %s\n", pidShort)
 	for _, bp := range n.bootstrapPeers {
 		relayAddr := fmt.Sprintf("/p2p/%s/p2p-circuit/p2p/%s", bp.ID, pid)
 		relayMA, err := multiaddr.NewMultiaddr(relayAddr)
@@ -1948,12 +2008,80 @@ func (n *Node) dialPeerRelayFallback(pid peer.ID) error {
 		err = h.Connect(ctx, relayInfo)
 		cancel()
 		if err == nil {
-			fmt.Printf("p2pmobile: [dial] step3 RELAY connected to %s via %s\n", pidShort, bp.ID)
+			fmt.Printf("p2pmobile: [dial] RELAY connected to %s via %s — scheduling direct upgrade\n", pidShort, bp.ID)
+
+			// Push identify immediately so the remote peer learns our fresh
+			// addresses. This is critical for DCUtR: the hole-punch service
+			// needs both sides to know each other's real addresses.
+			if emitter, eErr := h.EventBus().Emitter(new(event.EvtLocalAddressesUpdated)); eErr == nil {
+				_ = emitter.Emit(event.EvtLocalAddressesUpdated{})
+				_ = emitter.Close()
+			}
+
+			// Schedule aggressive direct upgrade: try to punch through to
+			// direct QUIC/TCP within seconds (not the 45s debounce).
+			go n.aggressiveDirectUpgrade(pid)
 			return nil
 		}
-		fmt.Printf("p2pmobile: [dial] step3 relay failed to %s via %s: %v\n", pidShort, bp.ID, err)
+		fmt.Printf("p2pmobile: [dial] relay failed to %s via %s: %v\n", pidShort, bp.ID, err)
 	}
 	return fmt.Errorf("unreachable: %s", pid)
+}
+
+// aggressiveDirectUpgrade tries to upgrade a relay connection to direct.
+// It runs multiple fast passes with identify pushes between them, giving
+// DCUtR and our custom direct dialer every chance to punch through.
+func (n *Node) aggressiveDirectUpgrade(pid peer.ID) {
+	pidShort := pid.String()
+	if len(pidShort) > 16 {
+		pidShort = pidShort[:16]
+	}
+
+	// Wait briefly for identify exchange to complete on the relay connection.
+	// The remote peer's fresh addresses should arrive via identify within 1-2s.
+	time.Sleep(800 * time.Millisecond)
+
+	for attempt := 1; attempt <= 4; attempt++ {
+		n.mu.RLock()
+		h := n.host
+		running := n.running
+		n.mu.RUnlock()
+		if !running || h == nil {
+			return
+		}
+		if h.Network().Connectedness(pid) != network.Connected {
+			fmt.Printf("p2pmobile: [upgrade] peer %s disconnected, aborting\n", pidShort)
+			return
+		}
+		if n.hasDirectConnToPeer(pid) {
+			actual := actualConnTransport(h, pid)
+			fmt.Printf("p2pmobile: [upgrade] ✓ DIRECT achieved for %s (attempt %d) transport=%s\n", pidShort, attempt, actual)
+			return
+		}
+
+		fmt.Printf("p2pmobile: [upgrade] attempt %d/4 direct dial for %s\n", attempt, pidShort)
+		if n.tryDialPeerDirect(pid) {
+			actual := actualConnTransport(h, pid)
+			fmt.Printf("p2pmobile: [upgrade] ✓ DIRECT punched for %s (attempt %d) transport=%s\n", pidShort, attempt, actual)
+			// Close relay connections now that we have direct
+			for _, c := range h.Network().ConnsToPeer(pid) {
+				if strings.Contains(c.RemoteMultiaddr().String(), "p2p-circuit") {
+					c.Close()
+				}
+			}
+			return
+		}
+
+		// Between attempts: push identify again (fresh addrs may have arrived
+		// from Kotlin's discoverAndInjectRealAddrs) and back off briefly.
+		if emitter, err := h.EventBus().Emitter(new(event.EvtLocalAddressesUpdated)); err == nil {
+			_ = emitter.Emit(event.EvtLocalAddressesUpdated{})
+			_ = emitter.Close()
+		}
+		backoff := time.Duration(500+attempt*500) * time.Millisecond
+		time.Sleep(backoff)
+	}
+	fmt.Printf("p2pmobile: [upgrade] direct upgrade failed for %s after 4 attempts — staying on relay\n", pidShort)
 }
 
 func (n *Node) dialPeer(pid peer.ID) error {
@@ -2303,8 +2431,13 @@ func (n *Node) handleOptimizedStream(s network.Stream) {
 // ════════════════════════════════════════════════════════════════════════════
 
 // OnNetworkChanged should be called when the device's network changes (WiFi↔cellular).
-// It clears stale addresses, re-discovers real IPs, reconnects bootstrap, re-reserves
-// relay, and triggers identify push so remote peers learn our new addresses immediately.
+// It tears down ALL dead connections (including bootstrap), clears stale state, then
+// rebuilds from scratch: reconnect bootstrap → discover addrs → reserve relay → identify push.
+//
+// Critical ordering: close ALL sockets BEFORE reconnecting. After WiFi→4G, every existing
+// socket is dead but TCP keepalive takes minutes to detect. ensureBootstrap() would see
+// Connectedness==Connected on the dead socket and return immediately, causing all subsequent
+// steps (discoverRealAddrs, reserveRelay) to operate on the dead connection.
 func (n *Node) OnNetworkChanged() {
 	n.mu.RLock()
 	h := n.host
@@ -2313,7 +2446,7 @@ func (n *Node) OnNetworkChanged() {
 	if !running || h == nil {
 		return
 	}
-	p2pDebugf("p2pmobile: ⚡ OnNetworkChanged — refreshing addresses and connections\n")
+	fmt.Println("p2pmobile: ⚡ OnNetworkChanged — tearing down dead connections, rebuilding")
 
 	// 1. Clear ALL stale extra addresses (old WiFi/cellular IPs are now dead)
 	n.extraAddrsMu.Lock()
@@ -2322,7 +2455,7 @@ func (n *Node) OnNetworkChanged() {
 	n.extraAddrsMu.Unlock()
 	fmt.Printf("p2pmobile: [netchange] cleared %d stale extra addrs\n", oldCount)
 
-	// 2. Evict ALL pooled streams (old TCP connections are dead after network change)
+	// 2. Evict ALL pooled streams (old connections are dead after network change)
 	n.streamPoolMu.Lock()
 	poolCount := len(n.streamPool)
 	for pid, ps := range n.streamPool {
@@ -2330,48 +2463,56 @@ func (n *Node) OnNetworkChanged() {
 		delete(n.streamPool, pid)
 	}
 	n.streamPoolMu.Unlock()
-	p2pDebugf("p2pmobile: [netchange] evicted %d pooled streams\n", poolCount)
+	fmt.Printf("p2pmobile: [netchange] evicted %d pooled streams\n", poolCount)
 	n.clearIngressBudgets()
 
-	// 3. Reconnect bootstrap first (control plane) on the new link before tearing mesh.
+	// 3. Close ALL connections — including bootstrap. Every socket is dead after a
+	// network switch. Without this, ensureBootstrap() sees stale Connected state.
+	allPeers := h.Network().Peers()
+	fmt.Printf("p2pmobile: [netchange] closing %d peer connections (all dead sockets)\n", len(allPeers))
+	for _, p := range allPeers {
+		_ = h.Network().ClosePeer(p)
+	}
+
+	// 4. Clear stale peerstore addresses for non-bootstrap peers.
+	// After a network change, the remote peer's old IPs are likely dead too
+	// (especially if both sides switched networks). Keep bootstrap addrs (static).
+	bootstrapIDs := make(map[peer.ID]bool)
+	for _, bp := range n.bootstrapPeers {
+		bootstrapIDs[bp.ID] = true
+	}
+	for _, p := range allPeers {
+		if !bootstrapIDs[p] {
+			h.Peerstore().ClearAddrs(p)
+		}
+	}
+	fmt.Printf("p2pmobile: [netchange] cleared stale peerstore addrs for %d non-bootstrap peers\n", len(allPeers)-len(bootstrapIDs))
+
+	// 5. Brief pause to let kernel release dead sockets
+	time.Sleep(100 * time.Millisecond)
+
+	// 6. Reconnect bootstrap fresh on the new network interface
+	fmt.Println("p2pmobile: [netchange] reconnecting bootstrap on new network...")
 	n.ensureBootstrap()
 
-	// 4. Re-discover real addresses from the new bootstrap TCP local addr
+	// 7. Re-discover real addresses from the new bootstrap connection
 	n.discoverRealAddrs()
 
-	// 5. Re-reserve relay + advertised circuit addrs (reservation tied to bootstrap conn)
+	// 8. Re-reserve relay + advertise circuit addrs
 	n.reserveRelayOnBootstrap()
 	n.addRelayCircuitAddrs()
 
-	// 6. Stagger ClosePeer for non-bootstrap peers (avoids thundering herd; sockets are stale anyway)
-	var toClose []peer.ID
-	for _, p := range h.Network().Peers() {
-		isBootstrap := false
-		for _, bp := range n.bootstrapPeers {
-			if bp.ID == p {
-				isBootstrap = true
-				break
-			}
-		}
-		if !isBootstrap {
-			toClose = append(toClose, p)
-		}
-	}
-	for i, p := range toClose {
-		_ = h.Network().ClosePeer(p)
-		if i+1 < len(toClose) {
-			time.Sleep(25 * time.Millisecond)
-		}
+	// 9. Push updated identify so remotes learn fresh reachability (DCUtR / hole-punch).
+	if emitter, err := h.EventBus().Emitter(new(event.EvtLocalAddressesUpdated)); err == nil {
+		_ = emitter.Emit(event.EvtLocalAddressesUpdated{})
+		_ = emitter.Close()
+		fmt.Println("p2pmobile: [netchange] emitted EvtLocalAddressesUpdated → identify push")
 	}
 
-	// 7. Push updated identify so remotes learn fresh reachability (DCUtR / hole-punch).
-	// h.Connect already ran identify during ensureBootstrap, but we can also
-	// trigger a push for any currently-connected peer.
-	// SignalAddressChange is on BasicHost, not the Host interface — type-assert.
-	if bh, ok := h.(*basichost.BasicHost); ok {
-		bh.SignalAddressChange()
-		fmt.Println("p2pmobile: [netchange] triggered identify address change signal")
-	}
+	// 10. Reset direct-probe debounce so relay connections trigger immediate probes
+	n.directProbeMu.Lock()
+	n.directProbeLast = make(map[string]time.Time)
+	n.directProbeMu.Unlock()
 
 	// Log final state
 	var hasIPv6, hasRelay bool
