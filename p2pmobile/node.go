@@ -34,6 +34,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -117,6 +118,7 @@ type Node struct {
 	msgHandler    MessageHandler
 	directHandler DirectMessageHandler
 	connHandler   ConnectionHandler
+	fileHandler   FileTransferHandler
 
 	bootstrapPeers []peer.AddrInfo
 	relayReady     bool // true after successful relay reservation
@@ -247,6 +249,7 @@ func (n *Node) Start(dataDir string, bootstrapMultiaddrs string) error {
 
 	h.SetStreamHandler(protocol.ID(DirectMessageProtocol), n.handleDirectStream)
 	h.SetStreamHandler(protocol.ID(OptimizedDMProtocol), n.handleOptimizedStream)
+	h.SetStreamHandler(protocol.ID(FileTransferProtocol), n.handleFileTransferStream)
 	go n.streamPoolJanitor() // evict idle pooled streams
 	h.Network().Notify(&network.NotifyBundle{
 		ConnectedF: func(_ network.Network, c network.Conn) {
@@ -295,54 +298,72 @@ func (n *Node) Start(dataDir string, bootstrapMultiaddrs string) error {
 			if running {
 				for _, info := range bsPeers {
 					if info.ID.String() == remotePeer {
-						fmt.Printf("p2pmobile: [auto-reconnect] bootstrap peer %s lost — reconnecting immediately\n", remotePeer[:16])
+						fmt.Printf("p2pmobile: [auto-reconnect] bootstrap peer %s lost — reconnecting with backoff\n", remotePeer[:16])
 						go func(pi peer.AddrInfo) {
-							time.Sleep(2 * time.Second) // brief backoff
-							hh := n.host
-							if hh == nil {
-								return
-							}
-							// QUIC-strict: isolate peerstore
-							quicInfo := quicOnlyPeerInfo(pi)
-							if len(quicInfo.Addrs) > 0 {
-								allAddrs := hh.Peerstore().Addrs(pi.ID)
-								hh.Peerstore().ClearAddrs(pi.ID)
-								hh.Peerstore().AddAddrs(pi.ID, quicInfo.Addrs, peerstore.TempAddrTTL)
+							pidShort := pi.ID.String()[:16]
+							backoff := 2 * time.Second
+							const maxAttempts = 4
 
-								ctx, cancel := context.WithTimeout(n.ctx, 8*time.Second)
-								err := hh.Connect(ctx, quicInfo)
+							for attempt := 1; attempt <= maxAttempts; attempt++ {
+								if !n.running {
+									return
+								}
+								time.Sleep(backoff)
+								hh := n.host
+								if hh == nil {
+									return
+								}
+								// Already reconnected (e.g. keepalive beat us)?
+								if hh.Network().Connectedness(pi.ID) == network.Connected {
+									fmt.Printf("p2pmobile: [auto-reconnect] %s already connected (attempt %d)\n", pidShort, attempt)
+									return
+								}
+								fmt.Printf("p2pmobile: [auto-reconnect] attempt %d/%d for %s (backoff %v)\n", attempt, maxAttempts, pidShort, backoff)
+
+								// QUIC-strict: isolate peerstore
+								quicInfo := quicOnlyPeerInfo(pi)
+								if len(quicInfo.Addrs) > 0 {
+									allAddrs := hh.Peerstore().Addrs(pi.ID)
+									hh.Peerstore().ClearAddrs(pi.ID)
+									hh.Peerstore().AddAddrs(pi.ID, quicInfo.Addrs, peerstore.TempAddrTTL)
+
+									ctx, cancel := context.WithTimeout(n.ctx, 8*time.Second)
+									err := hh.Connect(ctx, quicInfo)
+									cancel()
+
+									hh.Peerstore().ClearAddrs(pi.ID)
+									hh.Peerstore().AddAddrs(pi.ID, allAddrs, peerstore.PermanentAddrTTL)
+
+									if err == nil {
+										transport := actualConnTransport(hh, pi.ID)
+										fmt.Printf("p2pmobile: [auto-reconnect] reconnected %s via %s (attempt %d)\n", pidShort, transport, attempt)
+										n.discoverRealAddrs()
+										n.reserveRelayOnBootstrap()
+										n.addRelayCircuitAddrs()
+										return
+									}
+									fmt.Printf("p2pmobile: [auto-reconnect] QUIC-strict failed %s: %v\n", pidShort, err)
+								}
+								// TCP fallback
+								tcpInfo := tcpOnlyPeerInfo(pi)
+								if len(tcpInfo.Addrs) == 0 {
+									tcpInfo = pi
+								}
+								ctx, cancel := context.WithTimeout(n.ctx, 10*time.Second)
+								err := hh.Connect(ctx, tcpInfo)
 								cancel()
-
-								hh.Peerstore().ClearAddrs(pi.ID)
-								hh.Peerstore().AddAddrs(pi.ID, allAddrs, peerstore.PermanentAddrTTL)
-
 								if err == nil {
 									transport := actualConnTransport(hh, pi.ID)
-									fmt.Printf("p2pmobile: [auto-reconnect] reconnected %s via %s\n", pi.ID.String()[:16], transport)
+									fmt.Printf("p2pmobile: [auto-reconnect] reconnected %s via %s (attempt %d)\n", pidShort, transport, attempt)
 									n.discoverRealAddrs()
 									n.reserveRelayOnBootstrap()
 									n.addRelayCircuitAddrs()
 									return
 								}
-								fmt.Printf("p2pmobile: [auto-reconnect] QUIC-strict failed %s: %v\n", pi.ID.String()[:16], err)
+								fmt.Printf("p2pmobile: [auto-reconnect] attempt %d/%d FAILED %s: %v\n", attempt, maxAttempts, pidShort, err)
+								backoff *= 2 // exponential: 2s → 4s → 8s → 16s
 							}
-							// TCP fallback
-							tcpInfo := tcpOnlyPeerInfo(pi)
-							if len(tcpInfo.Addrs) == 0 {
-								tcpInfo = pi
-							}
-							ctx, cancel := context.WithTimeout(n.ctx, 10*time.Second)
-							err := hh.Connect(ctx, tcpInfo)
-							cancel()
-							if err != nil {
-								fmt.Printf("p2pmobile: [auto-reconnect] FAILED %s: %v\n", pi.ID.String()[:16], err)
-								return
-							}
-							transport := actualConnTransport(hh, pi.ID)
-							fmt.Printf("p2pmobile: [auto-reconnect] reconnected %s via %s\n", pi.ID.String()[:16], transport)
-							n.discoverRealAddrs()
-							n.reserveRelayOnBootstrap()
-							n.addRelayCircuitAddrs()
+							fmt.Printf("p2pmobile: [auto-reconnect] EXHAUSTED %d attempts for %s — keepalive will retry\n", maxAttempts, pidShort)
 						}(info)
 						break
 					}
@@ -726,8 +747,8 @@ func (n *Node) backgroundUpgrade() {
 		}
 		fmt.Printf("p2pmobile: [bg] advertised addr=%s transport=%s\n", addrStr, transport)
 	}
-	fmt.Printf("p2pmobile: [bg] upgrade complete — relay=%v dht=%v addrs={QUIC:%d TCP:%d} hasRealIP=%v hasIPv6=%v hasRelay=%v\n",
-		n.relayReady, n.dht != nil, quicAddrs, tcpAddrs, hasRealIP, hasIPv6, hasRelay)
+	fmt.Printf("p2pmobile: [bg] upgrade complete — relay=%v dht=%v addrs={QUIC:%d TCP:%d} hasRealIP=%v hasIPv6=%v hasRelay=%v pool={%s}\n",
+		n.relayReady, n.dht != nil, quicAddrs, tcpAddrs, hasRealIP, hasIPv6, hasRelay, PoolStats())
 
 	// Step 4 — keep-alive (runs forever)
 	n.keepAlive()
@@ -1608,9 +1629,9 @@ func unpackDirectBatch(packed []byte) ([][]byte, error) {
 		if off+ln > len(packed) {
 			return nil, fmt.Errorf("batch: truncated payload at frame %d", i)
 		}
-		frame := make([]byte, ln)
-		copy(frame, packed[off:off+ln])
-		out = append(out, frame)
+		// Zero-copy: slice directly into packed buffer — avoids make+copy per frame.
+		// Safe because packed (from JNI) is not reused while sendDirectFrames writes.
+		out = append(out, packed[off:off+ln])
 		off += ln
 	}
 	if off != len(packed) {
@@ -1624,13 +1645,15 @@ func writeV1Frame(s network.Stream, data []byte) error {
 		return fmt.Errorf("message too large")
 	}
 	length := uint32(len(data))
-	buf := make([]byte, 4+len(data))
+	needed := 4 + len(data)
+	buf := getFrameBuf(needed)
 	buf[0] = byte(length >> 24)
 	buf[1] = byte(length >> 16)
 	buf[2] = byte(length >> 8)
 	buf[3] = byte(length)
 	copy(buf[4:], data)
-	_, err := s.Write(buf)
+	_, err := s.Write(buf[:needed])
+	putFrameBuf(buf)
 	return err
 }
 
@@ -1722,9 +1745,15 @@ func (n *Node) sendDirectFrames(targetPeerID string, frames [][]byte) error {
 	// ── Pooled v2 stream ─────────────────────────────────────────────
 	if ps := n.getPooledStream(targetPeerID); ps != nil {
 		var writeErr error
-		for _, data := range frames {
+		for i, data := range frames {
 			if writeErr = n.writeToPooledStream(ps, data); writeErr != nil {
 				break
+			}
+			// Yield between frames so QUIC ACK processing / congestion control can run.
+			// Without this, a tight loop of 4×512 KB writes can fill the congestion
+			// window and block, preventing ACKs from being processed on time.
+			if i < len(frames)-1 {
+				runtime.Gosched()
 			}
 		}
 		if writeErr == nil {
@@ -2304,20 +2333,23 @@ func (n *Node) writeToPooledStream(ps *pooledStream, data []byte) error {
 
 	// Compress payloads above threshold unless already compressed media (saves CPU on images).
 	if len(data) > compressionThreshold && !payloadLooksPreCompressed(data) && !jsonDmPayloadSkipsZlib(data) {
-		var buf bytes.Buffer
-		w := zlib.NewWriter(&buf)
-		w.Write(data)
-		w.Close()
-		compressed := buf.Bytes()
+		zbuf := getZlibBuf()
+		zw := getZlibWriter(zbuf)
+		zw.Write(data)
+		zw.Close()
+		putZlibWriter(zw)
+		compressed := zbuf.Bytes()
 		// Only use compression if it actually shrinks the data
 		if len(compressed) < len(data)-64 {
-			payload = compressed
+			payload = make([]byte, len(compressed))
+			copy(payload, compressed)
 			flags = 0x01
 			p2pDebugf("p2pmobile: [compress] %d → %d bytes (%.0f%% reduction)\n",
 				len(data), len(compressed), 100*(1-float64(len(compressed))/float64(len(data))))
 		} else {
 			payload = data
 		}
+		putZlibBuf(zbuf)
 	} else {
 		payload = data
 	}
@@ -2400,11 +2432,16 @@ func (n *Node) handleOptimizedStream(s network.Stream) {
 				}
 				continue
 			}
-			decompressed, err := io.ReadAll(io.LimitReader(r, maxMessageSize+1))
+			// Bounded decompression using pooled copy buffer (avoids io.ReadAll heap growth).
+			decompBuf := getZlibBuf()
+			copyBuf := getReadBuf()
+			_, cpErr := io.CopyBuffer(decompBuf, io.LimitReader(r, int64(maxMessageSize)+1), *copyBuf)
+			putReadBuf(copyBuf)
 			r.Close()
-			if err != nil || len(decompressed) > maxMessageSize {
+			if cpErr != nil || decompBuf.Len() > maxMessageSize {
 				malformed++
-				p2pDebugf("p2pmobile: v2 zlib read error from %s: %v\n", fromShort, err)
+				p2pDebugf("p2pmobile: v2 zlib read error from %s: %v (decompLen=%d)\n", fromShort, cpErr, decompBuf.Len())
+				putZlibBuf(decompBuf)
 				if malformed >= dmMaxMalformedFrames {
 					fmt.Printf("p2pmobile: SECURITY dm v2 too many bad decompress peer=%s\n", fromShort)
 					s.Reset()
@@ -2412,8 +2449,11 @@ func (n *Node) handleOptimizedStream(s network.Stream) {
 				}
 				continue
 			}
-			data = decompressed
+			// Copy out of pool buffer before returning it
+			data = make([]byte, decompBuf.Len())
+			copy(data, decompBuf.Bytes())
 			p2pDebugf("p2pmobile: [decompress] %d → %d bytes from %s\n", len(payload), len(data), fromShort)
+			putZlibBuf(decompBuf)
 		}
 
 		p2pDebugf("p2pmobile: v2 received %d bytes from %s\n", len(data), fromShort)
