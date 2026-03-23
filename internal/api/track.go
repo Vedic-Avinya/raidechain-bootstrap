@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -25,8 +26,9 @@ func NewTrackAPI(store *redis.Store, pushSender fcm.PushSender) *TrackAPI {
 // --- POST /track/sessions ---
 
 type createSessionReq struct {
-	PeerID          string `json:"peerId"`
-	DurationMinutes int    `json:"durationMinutes"`
+	PeerID             string `json:"peerId"`
+	DurationMinutes    int    `json:"durationMinutes"`
+	DirectInvitePeerID string `json:"directInvitePeerId,omitempty"`
 }
 
 type createSessionResp struct {
@@ -59,16 +61,54 @@ func (t *TrackAPI) CreateSession(w http.ResponseWriter, r *http.Request) {
 		req.DurationMinutes = 120
 	}
 
-	session, err := t.store.CreateTrackSession(r.Context(), req.PeerID, req.DurationMinutes)
+	directInvite := strings.TrimSpace(req.DirectInvitePeerID)
+
+	// One non-expired session per owner: reject creating another until the current one ends or expires.
+	existing, err := t.store.GetOwnerActiveTrackSession(r.Context(), req.PeerID)
+	if err != nil {
+		slog.Error("track_create_check_existing_failed", "peer_id", req.PeerID, "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if existing != nil && time.Now().Unix() <= existing.ExpiresAt {
+		slog.Info("track_create_rejected_active_exists",
+			"owner", req.PeerID,
+			"existing_session_id", existing.SessionID,
+			"expires_at", existing.ExpiresAt,
+			"requested_direct_invite_len", len(directInvite),
+		)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error":       "active_session_exists",
+			"sessionId":   existing.SessionID,
+			"expiresAt":   existing.ExpiresAt,
+			"durationMin": existing.DurationMinutes,
+		})
+		return
+	}
+
+	session, err := t.store.CreateTrackSession(r.Context(), req.PeerID, req.DurationMinutes, directInvite)
 	if err != nil {
 		slog.Error("track_create_session_failed", "peer_id", req.PeerID, "err", err)
 		http.Error(w, "failed to create session", http.StatusInternalServerError)
 		return
 	}
-
 	sessionID := session.SessionID
+	if directInvite != "" {
+		if err := t.store.PatchTrackSessionDirectInvite(r.Context(), sessionID, directInvite); err != nil {
+			slog.Warn("track_patch_direct_invite_failed", "session_id", sessionID, "err", err)
+		}
+	}
+
 	joinURL := "https://www.ridechain.in/track/join/" + sessionID
-	slog.Info("track_session_created", "session_id", sessionID, "owner", req.PeerID, "duration", req.DurationMinutes)
+	slog.Info("track_session_created",
+		"session_id", sessionID,
+		"owner", req.PeerID,
+		"duration", req.DurationMinutes,
+		"direct_invite_len", len(directInvite),
+		"direct_invite_suffix", trimPeerSuffix(directInvite),
+	)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(createSessionResp{
@@ -178,23 +218,51 @@ func (t *TrackAPI) RequestToTrack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Store watcher status as "requested"
 	ttl := time.Duration(session.DurationMinutes) * time.Minute
-	if err := t.store.SetWatcherStatus(r.Context(), sessionID, req.WatcherPeerID, redis.WatcherRequested, ttl); err != nil {
+	watcherName := strings.TrimSpace(req.WatcherName)
+	if watcherName == "" {
+		watcherName = "Someone"
+	}
+
+	invite := strings.TrimSpace(session.DirectInvitePeerID)
+	watcher := strings.TrimSpace(req.WatcherPeerID)
+	autoApprove := invite != "" && watcher == invite
+
+	slog.Info("track_request_received",
+		"session_id", sessionID,
+		"watcher_peer_id_len", len(watcher),
+		"watcher_suffix", trimPeerSuffix(watcher),
+		"direct_invite_suffix", trimPeerSuffix(invite),
+		"auto_approve", autoApprove,
+	)
+
+	var watcherStatus redis.WatcherStatus
+	if autoApprove {
+		watcherStatus = redis.WatcherApproved
+	} else {
+		watcherStatus = redis.WatcherRequested
+	}
+
+	if err := t.store.SetWatcherStatus(r.Context(), sessionID, req.WatcherPeerID, watcherStatus, ttl); err != nil {
 		slog.Error("track_set_watcher_failed", "session_id", sessionID, "watcher", req.WatcherPeerID, "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
-	watcherName := strings.TrimSpace(req.WatcherName)
-	if watcherName == "" {
-		watcherName = "Someone"
-	}
 	if err := t.store.SetWatcherRequestMeta(r.Context(), sessionID, req.WatcherPeerID, watcherName, req.WatcherCity, ttl); err != nil {
 		slog.Warn("track_set_watcher_meta_failed", "session_id", sessionID, "watcher", req.WatcherPeerID, "err", err)
 	}
 
-	// Send FCM push to the session owner
+	// Direct invite (1:1 chat share): auto-approve — no owner approval notification.
+	if autoApprove {
+		t.sendWatcherApprovedFCM(r.Context(), sessionID, req.WatcherPeerID)
+		slog.Info("track_request_auto_approved", "session_id", sessionID, "watcher", req.WatcherPeerID)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "approved"})
+		return
+	}
+
+	// Send FCM push to the session owner (approval required)
 	ownerMeta, err := t.store.GetPeer(r.Context(), session.OwnerPeerID)
 	if err != nil {
 		slog.Warn("track_request_get_owner_failed", "owner", session.OwnerPeerID, "err", err)
@@ -506,10 +574,53 @@ func (t *TrackAPI) ListPendingRequests(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// EndSession handles POST /track/sessions/{id}/end — owner stops sharing early; invalidates server-side session.
+func (t *TrackAPI) EndSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	sessionID := extractTrackSubPath(r.URL.Path, "/end")
+	if sessionID == "" {
+		http.Error(w, "sessionId required", http.StatusBadRequest)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1024)
+	var req struct {
+		OwnerPeerID string `json:"ownerPeerId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	req.OwnerPeerID = strings.TrimSpace(req.OwnerPeerID)
+	if req.OwnerPeerID == "" {
+		http.Error(w, "ownerPeerId required", http.StatusBadRequest)
+		return
+	}
+	if err := t.store.EndTrackSession(r.Context(), req.OwnerPeerID, sessionID); err != nil {
+		slog.Warn("track_end_session_failed", "session_id", sessionID, "owner", req.OwnerPeerID, "err", err)
+		msg := err.Error()
+		code := http.StatusBadRequest
+		if strings.Contains(msg, "not session owner") {
+			code = http.StatusForbidden
+		} else if strings.Contains(msg, "not found") {
+			code = http.StatusNotFound
+		}
+		http.Error(w, msg, code)
+		return
+	}
+	slog.Info("track_session_ended_by_owner", "session_id", sessionID, "owner", req.OwnerPeerID)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ended"})
+}
+
 // RouteSession dispatches /track/sessions/{id}[/sub] to the correct handler.
 func (t *TrackAPI) RouteSession(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	switch {
+	case strings.HasSuffix(path, "/end"):
+		t.EndSession(w, r)
 	case strings.HasSuffix(path, "/request"):
 		t.RequestToTrack(w, r)
 	case strings.HasSuffix(path, "/respond"):
@@ -528,6 +639,26 @@ func (t *TrackAPI) RouteSession(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (t *TrackAPI) sendWatcherApprovedFCM(ctx context.Context, sessionID, watcherPeerID string) {
+	watcherMeta, err := t.store.GetPeer(ctx, watcherPeerID)
+	if err != nil {
+		slog.Warn("track_approved_get_watcher_failed", "watcher", watcherPeerID, "err", err)
+	}
+	if watcherMeta != nil && watcherMeta.FCMToken != "" {
+		pushData := map[string]string{
+			"type":       "track_approved",
+			"session_id": sessionID,
+			"title":      "Request Approved",
+			"body":       "Your tracking request has been approved. You can now see their live location.",
+		}
+		if err := t.pushSender.SendDataOnly(ctx, watcherMeta.FCMToken, pushData); err != nil {
+			slog.Warn("track_approved_fcm_failed", "session_id", sessionID, "watcher", watcherPeerID, "err", err)
+		} else {
+			slog.Info("track_approved_fcm_sent", "session_id", sessionID, "watcher", watcherPeerID)
+		}
+	}
+}
+
 // --- Helpers ---
 
 func extractPathParam(path, prefix string) string {
@@ -535,6 +666,14 @@ func extractPathParam(path, prefix string) string {
 		return ""
 	}
 	return strings.TrimSpace(strings.TrimPrefix(path, prefix))
+}
+
+func trimPeerSuffix(peerID string) string {
+	s := strings.TrimSpace(peerID)
+	if len(s) <= 12 {
+		return s
+	}
+	return "…" + s[len(s)-12:]
 }
 
 // extractTrackSubPath extracts sessionID from paths like /track/sessions/{id}/request

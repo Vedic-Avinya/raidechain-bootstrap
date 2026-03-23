@@ -46,6 +46,8 @@ type TrackSession struct {
 	CreatedAt       int64  `json:"created_at"` // unix seconds
 	ExpiresAt       int64  `json:"expires_at"` // unix seconds
 	Status          string `json:"status"`     // active, expired
+	// DirectInvitePeerID: when set, this watcher is auto-approved (e.g. 1:1 chat share link).
+	DirectInvitePeerID string `json:"direct_invite_peer_id,omitempty"`
 }
 
 // PendingTrackRequest is a watcher waiting for owner approval.
@@ -63,7 +65,9 @@ type TrackLocation struct {
 }
 
 // CreateTrackSession creates or reuses the owner's single active track session in Redis.
-func (s *Store) CreateTrackSession(ctx context.Context, ownerPeerID string, durationMinutes int) (*TrackSession, error) {
+// directInvitePeerID is stored on newly created sessions; when reusing an existing session, call
+// PatchTrackSessionDirectInvite so the invite target can still be updated.
+func (s *Store) CreateTrackSession(ctx context.Context, ownerPeerID string, durationMinutes int, directInvitePeerID string) (*TrackSession, error) {
 	ownerPeerID = strings.TrimSpace(ownerPeerID)
 	if ownerPeerID == "" {
 		return nil, fmt.Errorf("owner peer id required")
@@ -86,12 +90,13 @@ func (s *Store) CreateTrackSession(ctx context.Context, ownerPeerID string, dura
 	sessionID := randomTrackSessionID()
 	now := time.Now().Unix()
 	session := TrackSession{
-		SessionID:       sessionID,
-		OwnerPeerID:     ownerPeerID,
-		DurationMinutes: durationMinutes,
-		CreatedAt:       now,
-		ExpiresAt:       now + int64(durationMinutes*60),
-		Status:          string(TrackStatusActive),
+		SessionID:          sessionID,
+		OwnerPeerID:      ownerPeerID,
+		DurationMinutes:  durationMinutes,
+		CreatedAt:        now,
+		ExpiresAt:        now + int64(durationMinutes*60),
+		Status:           string(TrackStatusActive),
+		DirectInvitePeerID: strings.TrimSpace(directInvitePeerID),
 	}
 	data, err := json.Marshal(session)
 	if err != nil {
@@ -105,6 +110,39 @@ func (s *Store) CreateTrackSession(ctx context.Context, ownerPeerID string, dura
 		return nil, err
 	}
 	return &session, nil
+}
+
+// PatchTrackSessionDirectInvite sets or updates the peer id that is auto-approved when requesting
+// (1:1 chat share). Call after CreateTrackSession when reusing an existing session.
+func (s *Store) PatchTrackSessionDirectInvite(ctx context.Context, sessionID, directInvitePeerID string) error {
+	sessionID = strings.TrimSpace(sessionID)
+	directInvitePeerID = strings.TrimSpace(directInvitePeerID)
+	if sessionID == "" || directInvitePeerID == "" {
+		return nil
+	}
+	sess, err := s.GetTrackSession(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	if sess == nil {
+		return fmt.Errorf("session not found")
+	}
+	if time.Now().Unix() > sess.ExpiresAt {
+		return fmt.Errorf("session expired")
+	}
+	sess.DirectInvitePeerID = directInvitePeerID
+	data, err := json.Marshal(sess)
+	if err != nil {
+		return err
+	}
+	ttl := time.Until(time.Unix(sess.ExpiresAt, 0))
+	if ttl <= 0 {
+		ttl = time.Minute
+	}
+	if ttl > maxSessionTTL {
+		ttl = maxSessionTTL
+	}
+	return s.client.Set(ctx, keyTrackSession+sessionID, data, ttl).Err()
 }
 
 func randomTrackSessionID() string {
@@ -255,6 +293,60 @@ func (s *Store) PublishTrackLocation(ctx context.Context, sessionID string, lat,
 		return err
 	}
 	return s.client.Set(ctx, keyTrackLocation+sessionID, data, ttl).Err()
+}
+
+// EndTrackSession removes session data, owner mapping, cached location, and all watcher keys.
+// Call when the owner stops sharing before natural expiry.
+func (s *Store) EndTrackSession(ctx context.Context, ownerPeerID, sessionID string) error {
+	ownerPeerID = strings.TrimSpace(ownerPeerID)
+	sessionID = strings.TrimSpace(sessionID)
+	if ownerPeerID == "" || sessionID == "" {
+		return fmt.Errorf("owner and session id required")
+	}
+	sess, err := s.GetTrackSession(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	if sess == nil {
+		return fmt.Errorf("session not found")
+	}
+	if sess.OwnerPeerID != ownerPeerID {
+		return fmt.Errorf("not session owner")
+	}
+
+	pipe := s.client.Pipeline()
+	pipe.Del(ctx, keyTrackSession+sessionID)
+	pipe.Del(ctx, keyTrackLocation+sessionID)
+	pipe.Del(ctx, keyTrackOwnerSession+ownerPeerID)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return err
+	}
+
+	deleteByPattern := func(pattern string) error {
+		var cursor uint64
+		for {
+			keys, next, err := s.client.Scan(ctx, cursor, pattern, 100).Result()
+			if err != nil {
+				return err
+			}
+			if len(keys) > 0 {
+				if err := s.client.Del(ctx, keys...).Err(); err != nil {
+					return err
+				}
+			}
+			cursor = next
+			if cursor == 0 {
+				break
+			}
+		}
+		return nil
+	}
+	patWatcher := fmt.Sprintf("%s%s:*", keyTrackWatcher, sessionID)
+	patMeta := fmt.Sprintf("%s%s:*", keyTrackWatcherMeta, sessionID)
+	if err := deleteByPattern(patWatcher); err != nil {
+		return err
+	}
+	return deleteByPattern(patMeta)
 }
 
 // GetTrackLocation returns the latest published location for a session.

@@ -1,5 +1,46 @@
 # p2pmobile native P2P — architecture notes
 
+## Hybrid Transport (QUIC + TCP)
+
+The node uses a **hybrid QUIC-first, TCP-fallback** strategy for optimal connectivity:
+
+### Transport Stack
+- **QUIC (UDP)**: Low latency, better for mobile networks. Uses `/quic-v1` multiaddr format.
+- **TCP**: Reliable fallback for NAT/unreachable scenarios.
+
+### Listen Addresses
+```
+/ip4/0.0.0.0/udp/0/quic-v1      # IPv4 QUIC (preferred)
+/ip6/::/udp/0/quic-v1           # IPv6 QUIC
+/ip4/0.0.0.0/tcp/0              # IPv4 TCP (fallback)
+/ip6/::/tcp/0                   # IPv6 TCP (fallback)
+```
+
+### Dial Strategy (Hybrid)
+When connecting to a peer:
+
+1. **QUIC first**: Try QUIC (UDP) addresses for lower latency
+2. **TCP fallback**: If QUIC fails, try TCP addresses
+3. **IPv6 priority**: IPv6 addresses are tried before IPv4 when available
+4. **DHT fallback**: If peerstore addresses fail, query DHT and retry
+
+Priority order:
+```
+IPv6-QUIC > IPv6-TCP > QUIC > TCP
+```
+
+### Bootstrap Connections
+Bootstrap connections also use hybrid strategy:
+1. Try QUIC first (lower latency, better for mobile)
+2. Fall back to TCP if QUIC fails
+
+### Why Hybrid?
+- **QUIC benefits**: Lower latency, better NAT traversal on mobile networks
+- **TCP fallback**: Reliable when QUIC is blocked by firewalls/carriers
+- **IPv6 preference**: Many 4G/5G carriers give public IPv6, enabling direct connections
+
+---
+
 ## Direct messaging (`/ridechain/dm/1.0.0`, `/ridechain/dm/2.0.0`)
 
 - **v2 (preferred):** One long-lived stream per peer (pool). Each *application* payload is one **frame**: `[flags:1][len:4 BE][payload]`, optional zlib when `flags&1`.

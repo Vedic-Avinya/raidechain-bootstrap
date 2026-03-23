@@ -20,12 +20,12 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
-	dht "github.com/libp2p/go-libp2p-kad-dht"
-	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/ridechain/ridechain/services/bootstrap/internal/analytics"
@@ -85,17 +85,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Create libp2p host with TCP + WebSocket transports and relay.
-	// QUIC REMOVED: quic-go v0.48.2 panics with "crypto/tls bug: where's
-	// my session ticket?" on incoming QUIC connections, causing a crash loop
-	// (restart counter hit 161+).  TCP + WS is sufficient.
-	slog.Info("step", "n", 3, "msg", "creating libp2p host (TCP + WebSocket)")
+	// Create libp2p host with TCP + WebSocket + QUIC transports and relay.
+	// QUIC enabled: UDP for lower latency, TCP fallback.
+	slog.Info("step", "n", 3, "msg", "creating libp2p host (TCP + WebSocket + QUIC)")
 	var h host.Host
 	h, err = libp2p.New(
 		libp2p.Identity(priv),
 		libp2p.ListenAddrStrings(
 			fmt.Sprintf("/ip4/0.0.0.0/tcp/%s", port),
 			fmt.Sprintf("/ip4/0.0.0.0/tcp/%s/ws", wsPort),
+			fmt.Sprintf("/ip4/0.0.0.0/udp/%s/quic-v1", port), // QUIC on same port as TCP
 		),
 		libp2p.EnableRelay(),
 		libp2p.EnableRelayService(
@@ -117,7 +116,13 @@ func main() {
 	// Log every listen address.
 	for i, addr := range h.Addrs() {
 		full := fmt.Sprintf("%s/p2p/%s", addr, h.ID())
-		slog.Info("step", "n", 4, "msg", "listening", "i", i+1, "multiaddr", full)
+		transport := "TCP"
+		if strings.Contains(addr.String(), "/udp/") {
+			transport = "QUIC"
+		} else if strings.Contains(addr.String(), "/ws") {
+			transport = "WebSocket"
+		}
+		slog.Info("step", "n", 4, "msg", "listening", "i", i+1, "multiaddr", full, "transport", transport)
 	}
 
 	// Log connection events (Debug by default to reduce GCP log volume).
