@@ -103,7 +103,6 @@ gcloud compute ssh ridechain-bootstrap --zone=asia-south1-a
 ### Step 2.2 — Upload your code to the VM
 
 **Option A — from your Mac terminal (run OUTSIDE the VM):**
-
 ```bash
 # Copy the bootstrap folder to the VM
 gcloud compute scp --recurse \
@@ -113,7 +112,6 @@ gcloud compute scp --recurse \
 ```
 
 **Option B — git clone on the VM (if repo is on GitHub):**
-
 ```bash
 # On the VM:
 git clone https://github.com/YOUR_ORG/ridechain.git /tmp/ridechain
@@ -129,7 +127,6 @@ sudo bash scripts/setup-gcp.sh
 ```
 
 This script does everything automatically:
-
 - Installs Go 1.24, Redis, Docker, Caddy
 - Builds the bootstrap binary
 - Creates `/etc/ridechain/.env` with a fresh identity seed
@@ -144,8 +141,7 @@ Wait for it to finish (~5-10 min). At the end you'll see `Setup Complete` with n
 
 ## PART 3 — Configure .env (The Most Important Step)
 
-The setup script created `/etc/ridechain/.env` with safe defaults. You only need to fill in 4–5
-values.
+The setup script created `/etc/ridechain/.env` with safe defaults. You only need to fill in 4–5 values.
 
 ### Step 3.1 — Open the .env file
 
@@ -187,7 +183,6 @@ LOG_LEVEL=info                   ← leave
 ```
 
 **In nano:**
-
 - Arrow keys to move, type to edit
 - `Ctrl+O` then `Enter` to save
 - `Ctrl+X` to exit
@@ -195,7 +190,6 @@ LOG_LEVEL=info                   ← leave
 ### Step 3.2 — Upload Firebase service account key (for FCM)
 
 **On your Mac** (not the VM), run:
-
 ```bash
 # Replace the path with where you downloaded the key from Firebase Console
 gcloud compute scp ~/Downloads/your-firebase-sa-key.json \
@@ -204,7 +198,6 @@ gcloud compute scp ~/Downloads/your-firebase-sa-key.json \
 ```
 
 **Back on the VM:**
-
 ```bash
 sudo mv /tmp/firebase-sa.json /etc/ridechain/firebase-sa.json
 sudo chmod 600 /etc/ridechain/firebase-sa.json
@@ -212,7 +205,6 @@ sudo chown ridechain:ridechain /etc/ridechain/firebase-sa.json
 ```
 
 Then uncomment this line in `/etc/ridechain/.env`:
-
 ```bash
 GOOGLE_APPLICATION_CREDENTIALS=/etc/ridechain/firebase-sa.json
 ```
@@ -276,15 +268,14 @@ Go to **Cloudflare Dashboard → ridechain.in → DNS → Records → Add record
 
 Add these **4 records** (use your actual VM IP):
 
-| Type | Name        | IPv4 address | Proxy status             |
-|------|-------------|--------------|--------------------------|
-| A    | `ws`        | `YOUR_VM_IP` | ✅ Proxied (orange cloud) |
-| A    | `api`       | `YOUR_VM_IP` | ✅ Proxied (orange cloud) |
-| A    | `bootstrap` | `YOUR_VM_IP` | ⚠️ DNS only (grey cloud) |
-| A    | `grafana`   | `YOUR_VM_IP` | ✅ Proxied (optional)     |
+| Type | Name | IPv4 address | Proxy status |
+|------|------|-------------|--------------|
+| A | `ws` | `YOUR_VM_IP` | ✅ Proxied (orange cloud) |
+| A | `api` | `YOUR_VM_IP` | ✅ Proxied (orange cloud) |
+| A | `bootstrap` | `YOUR_VM_IP` | ⚠️ DNS only (grey cloud) |
+| A | `grafana` | `YOUR_VM_IP` | ✅ Proxied (optional) |
 
-> `bootstrap.ridechain.in` must be DNS only (not proxied) because libp2p uses TCP/UDP 4001, which
-> Cloudflare doesn't proxy.
+> `bootstrap.ridechain.in` must be DNS only (not proxied) because libp2p uses TCP/UDP 4001, which Cloudflare doesn't proxy.
 
 ### Step 5.2 — Enable WebSockets
 
@@ -299,7 +290,6 @@ Cloudflare Dashboard → **SSL/TLS → Overview** → Select **Full** (not Flexi
 ### Step 5.4 — Disable Cloudflare Cache for API
 
 Cloudflare Dashboard → **Rules → Cache Rules → Create rule**:
-
 - Rule name: `No cache for API and WS`
 - When: `Hostname equals api.ridechain.in OR Hostname equals ws.ridechain.in`
 - Then: Cache Eligibility → **Bypass cache**
@@ -321,42 +311,15 @@ sudo journalctl -u ridechain-bootstrap -f
 ```
 
 You should see lines like:
-
 ```json
-{
-  "level": "INFO",
-  "msg": "step",
-  "n": 1,
-  "msg": "bootstrap starting"
-}
-{
-  "level": "INFO",
-  "msg": "step",
-  "n": 9,
-  "msg": "redis store connected"
-}
-{
-  "level": "INFO",
-  "msg": "bootstrap_ready",
-  "peer_id": "12D3Koo...",
-  "tcp_port": "4001"
-}
-{
-  "level": "INFO",
-  "msg": "metrics",
-  "msg": "prometheus endpoint listening",
-  "port": "9090"
-}
-{
-  "level": "INFO",
-  "msg": "http_api",
-  "msg": "listening",
-  "port": "4005"
-}
+{"level":"INFO","msg":"step","n":1,"msg":"bootstrap starting"}
+{"level":"INFO","msg":"step","n":9,"msg":"redis store connected"}
+{"level":"INFO","msg":"bootstrap_ready","peer_id":"12D3Koo...","tcp_port":"4001"}
+{"level":"INFO","msg":"metrics","msg":"prometheus endpoint listening","port":"9090"}
+{"level":"INFO","msg":"http_api","msg":"listening","port":"4005"}
 ```
 
 If you see `redis connection failed` — check Redis is running:
-
 ```bash
 redis-cli ping   # should print: PONG
 sudo systemctl status redis-server
@@ -413,8 +376,7 @@ Profile (bottom left) → Change Password
 
 Left sidebar → **Connections → Data sources**
 
-You should see **Prometheus** already configured (auto-provisioned). Click it and click **Save &
-Test** — should show green "Data source connected".
+You should see **Prometheus** already configured (auto-provisioned). Click it and click **Save & Test** — should show green "Data source connected".
 
 ### Step 7.3 — Create your first dashboard
 
@@ -429,14 +391,14 @@ Test** — should show green "Data source connected".
 
 **Add these panels one by one:**
 
-| Panel title          | Query                                                             | Visualization |
-|----------------------|-------------------------------------------------------------------|---------------|
-| Active Riders        | `ridechain_riders_connected`                                      | Stat          |
-| Messages/sec         | `rate(ridechain_messages_relayed_total[1m])`                      | Time series   |
-| Dropped (rate limit) | `rate(ridechain_messages_dropped_total{reason="rate_limit"}[1m])` | Time series   |
-| Geo Topics Active    | `ridechain_geo_topics_active`                                     | Gauge         |
-| FCM Success Rate     | `rate(ridechain_fcm_pushes_total{result="success"}[5m])`          | Stat          |
-| Nearby Broadcasts    | `rate(ridechain_nearby_broadcasts_total[1m]) * 60`                | Time series   |
+| Panel title | Query | Visualization |
+|------------|-------|---------------|
+| Active Riders | `ridechain_riders_connected` | Stat |
+| Messages/sec | `rate(ridechain_messages_relayed_total[1m])` | Time series |
+| Dropped (rate limit) | `rate(ridechain_messages_dropped_total{reason="rate_limit"}[1m])` | Time series |
+| Geo Topics Active | `ridechain_geo_topics_active` | Gauge |
+| FCM Success Rate | `rate(ridechain_fcm_pushes_total{result="success"}[5m])` | Stat |
+| Nearby Broadcasts | `rate(ridechain_nearby_broadcasts_total[1m]) * 60` | Time series |
 
 ---
 
@@ -445,7 +407,6 @@ Test** — should show green "Data source connected".
 Every time you change code and want to update the server:
 
 **On your Mac (in the bootstrap folder):**
-
 ```bash
 # Build Linux binary
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
@@ -459,7 +420,6 @@ gcloud compute scp bootstrap-new \
 ```
 
 **On the VM:**
-
 ```bash
 # Backup current, swap in new, restart
 sudo cp /opt/ridechain/bootstrap /opt/ridechain/bootstrap.bak
@@ -557,11 +517,9 @@ From your Mac (test after DNS propagates):
 
 ## PART 11 — Blue/Green Deploy (Future: Zero Downtime)
 
-> Skip this for now. Use Part 8 re-deploy. Come back here when you have real users and can't afford
-> 5-second downtime.
+> Skip this for now. Use Part 8 re-deploy. Come back here when you have real users and can't afford 5-second downtime.
 
-The bootstrap is **stateful** — WebSocket connections are pinned to the process. Strategy: run new
-binary on shadow ports, verify, then atomic swap.
+The bootstrap is **stateful** — WebSocket connections are pinned to the process. Strategy: run new binary on shadow ports, verify, then atomic swap.
 
 ```
 Before:  Caddy → Bootstrap on :4003/:4004/:4005
@@ -589,7 +547,6 @@ sudo systemctl start ridechain-bootstrap
 ```
 
 **On SIGTERM, the bootstrap gracefully:**
-
 1. Stops accepting new WebSocket upgrades
 2. Sends `CloseGoingAway` frame to all connected riders
 3. Mobile apps auto-reconnect (implement `onClosing` with backoff in Android/iOS)
@@ -598,14 +555,14 @@ sudo systemctl start ridechain-bootstrap
 
 ## Cloudflare Settings Reference
 
-| Setting       | Where               | Value                                    |
-|---------------|---------------------|------------------------------------------|
-| WebSockets    | Network             | **Enabled**                              |
-| SSL/TLS mode  | SSL/TLS → Overview  | **Full**                                 |
-| Cache for API | Rules → Cache Rules | **Bypass** for api.ridechain.in          |
-| Cache for WS  | Rules → Cache Rules | **Bypass** for ws.ridechain.in           |
-| Always Online | Speed               | Disabled                                 |
-| Retry on 5xx  | Rules → Page Rules  | Enable for `*.ridechain.in/*` (optional) |
+| Setting | Where | Value |
+|---------|-------|-------|
+| WebSockets | Network | **Enabled** |
+| SSL/TLS mode | SSL/TLS → Overview | **Full** |
+| Cache for API | Rules → Cache Rules | **Bypass** for api.ridechain.in |
+| Cache for WS | Rules → Cache Rules | **Bypass** for ws.ridechain.in |
+| Always Online | Speed | Disabled |
+| Retry on 5xx | Rules → Page Rules | Enable for `*.ridechain.in/*` (optional) |
 
 ---
 
@@ -618,7 +575,6 @@ Internet → Cloudflare (proxy ON) → GCP Static IP → Caddy (:80/:443) → Bo
 ```
 
 The bootstrap is a **stateful** service — WebSocket connections are pinned to a process. This means:
-
 - Rolling updates to the same process = connection disruption
 - Strategy: **Blue/Green** (safest for WebSocket), with **graceful drain** on the old instance
 
@@ -626,8 +582,7 @@ The bootstrap is a **stateful** service — WebSocket connections are pinned to 
 
 ## Strategy: Blue/Green on a Single GCP VM (Current Setup)
 
-Since you run one VM today, blue/green means running **two processes simultaneously** during deploy,
-then shifting traffic.
+Since you run one VM today, blue/green means running **two processes simultaneously** during deploy, then shifting traffic.
 
 ```
 Before:  Cloudflare → Caddy → Bootstrap-OLD (port 4003/4004/4005)
@@ -741,14 +696,12 @@ ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.
 ```
 
 On `systemctl stop` (sends SIGTERM):
-
 1. `ctx.Done()` fires → both bridge `Run()` loops exit
 2. `server.Shutdown(5s context)` → HTTP server stops accepting new WS upgrades
 3. All connected riders/drivers receive WebSocket `CloseGoingAway` frame
 4. Mobile apps see the close frame and **automatically reconnect** to the new process
 
 **Client reconnect logic (required in apps):**
-
 ```kotlin
 // Android / rider app — auto-reconnect on close
 webSocket.onClosing { code, reason ->
@@ -758,8 +711,7 @@ webSocket.onClosing { code, reason ->
 }
 ```
 
-> **Note:** During the ~3–5s shutdown window, new connections are rejected (503). Cloudflare will
-> retry on failure if you enable **Retry on 5xx** in Cloudflare → Rules → Page Rules.
+> **Note:** During the ~3–5s shutdown window, new connections are rejected (503). Cloudflare will retry on failure if you enable **Retry on 5xx** in Cloudflare → Rules → Page Rules.
 
 ---
 
@@ -850,14 +802,14 @@ LOG_LEVEL=info
 
 ## Cloudflare Settings for Zero-Downtime Deploy
 
-| Setting              | Value                                                                          | Why                                                           |
-|----------------------|--------------------------------------------------------------------------------|---------------------------------------------------------------|
-| **WebSocket**        | Enabled (Network → WebSockets)                                                 | Required for rider/driver WS                                  |
-| **Proxy status**     | Proxied (orange cloud)                                                         | DDoS + edge TLS                                               |
-| **SSL/TLS mode**     | Full (not Flexible)                                                            | Caddy has valid cert; Full prevents MITM between CF and Caddy |
-| **Always Online**    | Disabled                                                                       | Not applicable for WebSocket APIs                             |
-| **Retry on failure** | Enable via Page Rule: `bootstrap.ridechain.in/*` → "Error rules: Retry on 5xx" | Auto-retry during 5s shutdown window                          |
-| **Health check**     | Cloudflare → Traffic → Health Checks → `GET /health` on port 80                | Alerts you when bootstrap is down                             |
+| Setting | Value | Why |
+|---------|-------|-----|
+| **WebSocket** | Enabled (Network → WebSockets) | Required for rider/driver WS |
+| **Proxy status** | Proxied (orange cloud) | DDoS + edge TLS |
+| **SSL/TLS mode** | Full (not Flexible) | Caddy has valid cert; Full prevents MITM between CF and Caddy |
+| **Always Online** | Disabled | Not applicable for WebSocket APIs |
+| **Retry on failure** | Enable via Page Rule: `bootstrap.ridechain.in/*` → "Error rules: Retry on 5xx" | Auto-retry during 5s shutdown window |
+| **Health check** | Cloudflare → Traffic → Health Checks → `GET /health` on port 80 | Alerts you when bootstrap is down |
 
 ---
 
@@ -869,8 +821,8 @@ name: Deploy Bootstrap
 
 on:
   push:
-    branches: [ main ]
-    paths: [ 'services/bootstrap/**' ]
+    branches: [main]
+    paths: ['services/bootstrap/**']
 
 jobs:
   deploy:
@@ -948,7 +900,6 @@ Cloudflare → GCP L4 LB (TCP, sticky by source IP)
 ```
 
 **Rolling update script (2 instances):**
-
 ```bash
 # Update Bootstrap-2 first (50% traffic)
 ./deploy.sh bootstrap-2
@@ -988,6 +939,7 @@ After deploy:
 [ ] Monitor logs for 5 minutes: journalctl -u ridechain-bootstrap -f
 [ ] Keep bootstrap.prev for 1 hour before deleting
 ```
+
 
 ```
 sudo mkdir -p /etc/ridechain
@@ -1051,5 +1003,20 @@ sudo chown ridechain:ridechain /opt/ridechain/bootstrap
 sudo systemctl restart ridechain-bootstrap
 
 sudo journalctl -u ridechain-bootstrap -f
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 GOFLAGS="-mod=mod" go build -ldflags="-s -w" -o bootstrap-new ./cmd/main.go && gcloud compute scp bootstrap-new instance-20260317-201243:/tmp/bootstrap-new --zone=asia-south1-a --project=ridechain-90ebd && gcloud compute ssh instance-20260317-201243 --zone=asia-south1-a --project=ridechain-90ebd --command='set -e; sudo cp /opt/ridechain-bootstrap/bootstrap /opt/ridechain-bootstrap/bootstrap.bak || true; sudo mv /tmp/bootstrap-new /opt/ridechain-bootstrap/bootstrap; sudo chmod +x /opt/ridechain-bootstrap/bootstrap; sudo chown ridechain:ridechain /opt/ridechain-bootstrap/bootstrap; sudo systemctl restart ridechain-bootstrap; sleep 3; echo "=== systemctl ==="; sudo systemctl status ridechain-bootstrap --no-pager; echo; echo "=== recent logs ==="; sudo journalctl -u ridechain-bootstrap -n 30 --no-pager'
+
+
+cd /Users/umashankar.pathak/Documents/Learn_Node/ride/bootstrap && GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o /tmp/bootstrap-linux ./cmd/main.go
+
+scp /tmp/bootstrap-linux 34.93.241.95:/tmp/bootstrap-new
+
+gcloud compute scp /tmp/bootstrap-linux instance-20260317-201243:/tmp/bootstrap-new --zone=asia-south1-a --project=ridechain-90ebd
+
+gcloud compute ssh instance-20260317-201243 --zone=asia-south1-a --project=ridechain-90ebd --command="sudo bash -c 'systemctl stop ridechain-bootstrap; cp 
+p /opt/ridechain-bootstrap/bootstrap.bak; mv /tmp/bootstrap-new /opt/ridechain-bootstrap/bootstrap; chmod +x /opt/ridechain-bootstrap/bootstrap; chown ridechain:ridechain /opt/ridechain-bootstrap/boots
+ootstrap; sleep 3; systemctl status ridechain-bootstrap --no-pager'"
+
+cd /Users/umashankar.pathak/Documents/Learn_Node/ride/bootstrap
+n-bootstrap; sleep 3; echo "=== systemctl ==="; sudo systemctl status ridechain-bootstrap --no-pager; echo; echo "=== recent logs ==="; sudo journalctl -u ridechain-bootstrap -n 30 --no-pager'
+
+
 ```

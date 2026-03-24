@@ -61,7 +61,7 @@ import (
 // Jittered backoff between passes lets addresses/identify propagate (mobile handover).
 // Note: "99.99% direct" is not achievable on the open internet (CGNAT, offline peers, firewalls);
 // relay remains the correctness fallback; these passes maximize direct when paths exist.
-const directDialPasses = 3
+const directDialPasses = 2
 
 // dmWriterBufferSize is the pooled v2 stream bufio size — larger = fewer syscalls for blob batches.
 const dmWriterBufferSize = 512 * 1024
@@ -235,10 +235,24 @@ func (n *Node) Start(dataDir string, bootstrapMultiaddrs string) error {
 			extra := make([]multiaddr.Multiaddr, len(n.extraAddrs))
 			copy(extra, n.extraAddrs)
 			n.extraAddrsMu.RUnlock()
+			all := addrs
 			if len(extra) > 0 {
-				return append(addrs, extra...)
+				all = append(all, extra...)
 			}
-			return addrs
+			// Filter out loopback and bind-all addresses — useless to remote
+			// peers and cause wasted dial attempts + pollute peerstore.
+			filtered := make([]multiaddr.Multiaddr, 0, len(all))
+			for _, a := range all {
+				s := a.String()
+				if strings.Contains(s, "/ip4/127.0.0.1/") ||
+					strings.Contains(s, "/ip6/::1/") ||
+					strings.Contains(s, "/ip4/0.0.0.0/") ||
+					strings.Contains(s, "/ip6/::/") {
+					continue
+				}
+				filtered = append(filtered, a)
+			}
+			return filtered
 		}),
 	)
 	if err != nil {
@@ -475,6 +489,44 @@ func (n *Node) bootstrapWithRetry() {
 					n.discoverRealAddrs()
 					n.reserveRelayOnBootstrap()
 					n.addRelayCircuitAddrs()
+
+					// Also open a TCP connection to bootstrap so identify learns
+					// our TCP NAT-mapped address (observed addr). Without this,
+					// peers only get our QUIC public addr and have no TCP fallback
+					// when QUIC hole-punching fails through NAT.
+					go func(bInfo peer.AddrInfo) {
+						tcpBI := tcpOnlyPeerInfo(bInfo)
+						if len(tcpBI.Addrs) == 0 {
+							fmt.Printf("p2pmobile: [bootstrap] no TCP addrs for bootstrap — skipping secondary TCP\n")
+							return
+						}
+						// Must use WithForceDirectDial — without it, h.Connect sees the
+						// existing QUIC connection and returns nil without dialing TCP.
+						// Also isolate peerstore to TCP-only addrs to prevent the swarm
+						// from reusing the QUIC connection.
+						allAddrs := h.Peerstore().Addrs(bInfo.ID)
+						h.Peerstore().ClearAddrs(bInfo.ID)
+						h.Peerstore().AddAddrs(bInfo.ID, tcpBI.Addrs, peerstore.TempAddrTTL)
+
+						ctxTCP, cancelTCP := context.WithTimeout(n.ctx, 10*time.Second)
+						ctxTCP = network.WithForceDirectDial(ctxTCP, "bootstrap-tcp-observed-addr")
+						err := h.Connect(ctxTCP, tcpBI)
+						cancelTCP()
+
+						// Restore full peerstore
+						h.Peerstore().ClearAddrs(bInfo.ID)
+						h.Peerstore().AddAddrs(bInfo.ID, allAddrs, peerstore.PermanentAddrTTL)
+
+						if err != nil {
+							fmt.Printf("p2pmobile: [bootstrap] secondary TCP connect failed: %v\n", err)
+							return
+						}
+						fmt.Printf("p2pmobile: [bootstrap] ✓ secondary TCP connected — identify will learn TCP observed addr\n")
+						// After TCP identify completes, re-discover to pick up TCP observed addr
+						time.Sleep(2 * time.Second)
+						n.discoverRealAddrs()
+					}(info)
+
 					break
 				}
 				fmt.Printf("p2pmobile: [bootstrap] QUIC-strict exhausted for %s after %v, trying TCP...\n",
@@ -629,6 +681,18 @@ func parseBootstrapAddrs(raw string) []peer.AddrInfo {
 		out = append(out, *info)
 	}
 	return out
+}
+
+// extractIPFromMultiaddr returns the IP address from a multiaddr string.
+// e.g. "/ip4/172.16.25.212/udp/34784/quic-v1" → "172.16.25.212"
+func extractIPFromMultiaddr(maStr string) string {
+	parts := strings.Split(maStr, "/")
+	for i, p := range parts {
+		if (p == "ip4" || p == "ip6") && i+1 < len(parts) {
+			return parts[i+1]
+		}
+	}
+	return ""
 }
 
 // actualConnTransport inspects the real connection to a peer and returns
@@ -807,7 +871,7 @@ func (n *Node) discoverRealAddrs() {
 					break
 				}
 			}
-			if ipAddr == "" || ipAddr == "127.0.0.1" || ipAddr == "::1" {
+			if ipAddr == "" || ipAddr == "127.0.0.1" || ipAddr == "::1" || ipAddr == "0.0.0.0" || ipAddr == "::" {
 				continue
 			}
 
@@ -964,7 +1028,8 @@ func (n *Node) provideAddrsToDHT() {
 	var tcpAddrs []string
 	for _, addr := range addrs {
 		addrStr := addr.String()
-		if strings.Contains(addrStr, "127.0.0.1") || strings.Contains(addrStr, "/ip6/::1") {
+		if strings.Contains(addrStr, "127.0.0.1") || strings.Contains(addrStr, "/ip6/::1") ||
+			strings.Contains(addrStr, "/ip4/0.0.0.0/") || strings.Contains(addrStr, "/ip6/::/") {
 			continue
 		}
 		if strings.Contains(addrStr, "p2p-circuit") {
@@ -1435,6 +1500,55 @@ func (n *Node) IsDirectConnection(peerID string) bool {
 		return false
 	}
 	return n.hasDirectConnToPeer(pid)
+}
+
+// GetPeerDirectAddr returns "ip:port" of the newest direct (non-relay) connection
+// to the given peer, or "" if none exists.  Used by Kotlin to inject the known
+// hole-punched address as a WebRTC ICE candidate for 0-RTT call setup.
+func (n *Node) GetPeerDirectAddr(peerID string) string {
+	pid, err := peer.Decode(strings.TrimSpace(peerID))
+	if err != nil {
+		return ""
+	}
+	n.mu.RLock()
+	h := n.host
+	n.mu.RUnlock()
+	if h == nil {
+		return ""
+	}
+	conns := h.Network().ConnsToPeer(pid)
+	// Walk newest → oldest; prefer direct.
+	for i := len(conns) - 1; i >= 0; i-- {
+		c := conns[i]
+		ra := c.RemoteMultiaddr()
+		if ra == nil {
+			continue
+		}
+		s := ra.String()
+		if strings.Contains(s, "/p2p-circuit") {
+			continue
+		}
+		// Extract IP + port from multiaddr like /ip4/1.2.3.4/udp/4001/quic-v1
+		// or /ip6/::1/tcp/9000
+		ip, _ := ra.ValueForProtocol(multiaddr.P_IP4)
+		if ip == "" {
+			ip, _ = ra.ValueForProtocol(multiaddr.P_IP6)
+		}
+		if ip == "" {
+			continue
+		}
+		port, _ := ra.ValueForProtocol(multiaddr.P_UDP)
+		if port == "" {
+			port, _ = ra.ValueForProtocol(multiaddr.P_TCP)
+		}
+		if port == "" {
+			continue
+		}
+		addr := ip + ":" + port
+		fmt.Printf("p2pmobile: GetPeerDirectAddr(%s) = %s\n", peerID[:16], addr)
+		return addr
+	}
+	return ""
 }
 
 func (n *Node) isBootstrapPeerID(id peer.ID) bool {
@@ -1912,7 +2026,9 @@ func (n *Node) IsConnectedToPeer(targetPeerID string) bool {
 // tryDialPeerDirect uses peerstore + DHT only (no circuit relay).
 // Strategy: QUIC-strict first (peerstore isolated to prevent relay sneak-in),
 // then TCP fallback. Returns true if a direct (non-relay) connection exists.
-func (n *Node) tryDialPeerDirect(pid peer.ID) bool {
+// If cachedDHTAddrs is non-nil, those addrs are used instead of a fresh DHT lookup
+// (avoids 5s DHT timeout on repeated passes).
+func (n *Node) tryDialPeerDirect(pid peer.ID, cachedDHTAddrs []multiaddr.Multiaddr) bool {
 	h := n.host
 	if h == nil {
 		return false
@@ -1925,13 +2041,51 @@ func (n *Node) tryDialPeerDirect(pid peer.ID) bool {
 		return true
 	}
 
+	// Determine which IP families we can actually reach from our listen addrs.
+	hasLocalIPv4, hasLocalIPv6 := false, false
+	for _, la := range h.Addrs() {
+		laStr := la.String()
+		if strings.Contains(laStr, "p2p-circuit") {
+			continue
+		}
+		if strings.Contains(laStr, "/ip4/") {
+			ip := extractIPFromMultiaddr(laStr)
+			if ip != "127.0.0.1" && ip != "0.0.0.0" {
+				hasLocalIPv4 = true
+			}
+		}
+		if strings.Contains(laStr, "/ip6/") {
+			ip := extractIPFromMultiaddr(laStr)
+			if ip != "::1" && ip != "::" {
+				hasLocalIPv6 = true
+			}
+		}
+	}
+
 	// Collect all known direct addresses (peerstore + DHT), split by transport.
+	// Skip addrs whose IP family we cannot reach (e.g. IPv6-only peer when we're IPv4-only).
 	var quicAddrs, tcpAddrs []multiaddr.Multiaddr
 	seen := make(map[string]bool)
+	var skippedFamily int
 
 	addIfNew := func(a multiaddr.Multiaddr) {
 		aStr := a.String()
 		if strings.Contains(aStr, "p2p-circuit") || seen[aStr] {
+			return
+		}
+		// Filter unroutable addresses (loopback, bind-all)
+		ip := extractIPFromMultiaddr(aStr)
+		if ip == "127.0.0.1" || ip == "::1" || ip == "0.0.0.0" || ip == "::" || ip == "" {
+			return
+		}
+		// Filter unreachable IP families
+		isV6 := strings.Contains(aStr, "/ip6/")
+		if isV6 && !hasLocalIPv6 {
+			skippedFamily++
+			return
+		}
+		if !isV6 && strings.Contains(aStr, "/ip4/") && !hasLocalIPv4 {
+			skippedFamily++
 			return
 		}
 		seen[aStr] = true
@@ -1947,24 +2101,38 @@ func (n *Node) tryDialPeerDirect(pid peer.ID) bool {
 		addIfNew(a)
 	}
 
-	// Source 2: DHT (if available)
-	n.mu.RLock()
-	d := n.dht
-	n.mu.RUnlock()
-	if d != nil {
-		ctx, cancel := context.WithTimeout(n.ctx, 5*time.Second)
-		peerInfo, err := d.FindPeer(ctx, pid)
-		cancel()
-		if err == nil {
-			for _, a := range peerInfo.Addrs {
-				addIfNew(a)
+	// Source 2: cached DHT addrs (or fresh lookup if nil)
+	if cachedDHTAddrs != nil {
+		for _, a := range cachedDHTAddrs {
+			addIfNew(a)
+		}
+	} else {
+		n.mu.RLock()
+		d := n.dht
+		n.mu.RUnlock()
+		if d != nil {
+			ctx, cancel := context.WithTimeout(n.ctx, 5*time.Second)
+			peerInfo, err := d.FindPeer(ctx, pid)
+			cancel()
+			if err == nil {
+				for _, a := range peerInfo.Addrs {
+					addIfNew(a)
+				}
+			} else {
+				fmt.Printf("p2pmobile: [dial] DHT FindPeer failed for %s: %v\n", pidShort, err)
 			}
-		} else {
-			fmt.Printf("p2pmobile: [dial] DHT FindPeer failed for %s: %v\n", pidShort, err)
 		}
 	}
 
-	fmt.Printf("p2pmobile: [dial] direct addrs for %s: QUIC=%d TCP=%d\n", pidShort, len(quicAddrs), len(tcpAddrs))
+	fmt.Printf("p2pmobile: [dial] direct addrs for %s: QUIC=%d TCP=%d (skippedFamily=%d localIPv4=%v localIPv6=%v)\n",
+		pidShort, len(quicAddrs), len(tcpAddrs), skippedFamily, hasLocalIPv4, hasLocalIPv6)
+
+	if len(quicAddrs) == 0 && len(tcpAddrs) == 0 {
+		if skippedFamily > 0 {
+			fmt.Printf("p2pmobile: [dial] no reachable addrs for %s — all %d addrs in unreachable IP family\n", pidShort, skippedFamily)
+		}
+		return false
+	}
 
 	// Priority order: QUIC first (lower latency, better mobile), then TCP.
 	// For each group, isolate peerstore to ONLY those addrs so h.Connect()
@@ -1981,7 +2149,9 @@ func (n *Node) tryDialPeerDirect(pid peer.ID) bool {
 		if len(g.addrs) == 0 {
 			continue
 		}
-		fmt.Printf("p2pmobile: [dial] trying %s %d addrs for %s\n", g.name, len(g.addrs), pidShort)
+		for i, a := range g.addrs {
+			fmt.Printf("p2pmobile: [dial] trying %s %d/%d for %s addr=%s\n", g.name, i+1, len(g.addrs), pidShort, a)
+		}
 
 		// Isolate peerstore: temporarily replace all addrs with ONLY our direct addrs.
 		// This prevents h.Connect from using relay circuit addrs that may be in peerstore.
@@ -1990,6 +2160,9 @@ func (n *Node) tryDialPeerDirect(pid peer.ID) bool {
 		h.Peerstore().AddAddrs(pid, g.addrs, peerstore.TempAddrTTL)
 
 		ctx, cancel := context.WithTimeout(n.ctx, 5*time.Second)
+		// WithForceDirectDial prevents h.Connect() from short-circuiting on an
+		// existing relay connection — it forces a real dial to our direct addrs.
+		ctx = network.WithForceDirectDial(ctx, "direct-upgrade")
 		err := h.Connect(ctx, peer.AddrInfo{ID: pid, Addrs: g.addrs})
 		cancel()
 
@@ -2037,7 +2210,7 @@ func (n *Node) dialPeerRelayFallback(pid peer.ID) error {
 		err = h.Connect(ctx, relayInfo)
 		cancel()
 		if err == nil {
-			fmt.Printf("p2pmobile: [dial] RELAY connected to %s via %s — scheduling direct upgrade\n", pidShort, bp.ID)
+			fmt.Printf("p2pmobile: [dial] RELAY connected to %s via %s\n", pidShort, bp.ID)
 
 			// Push identify immediately so the remote peer learns our fresh
 			// addresses. This is critical for DCUtR: the hole-punch service
@@ -2047,14 +2220,68 @@ func (n *Node) dialPeerRelayFallback(pid peer.ID) error {
 				_ = emitter.Close()
 			}
 
-			// Schedule aggressive direct upgrade: try to punch through to
-			// direct QUIC/TCP within seconds (not the 45s debounce).
-			go n.aggressiveDirectUpgrade(pid)
+			// NOTE: Do NOT launch aggressiveDirectUpgrade here — ConnectedF
+			// already triggers maybeScheduleDirectProbe (debounced) when the
+			// relay connection fires. Launching from both places causes two
+			// concurrent goroutines doing peerstore manipulation for the same
+			// peer, which is a race condition that destabilizes relay connections.
 			return nil
 		}
 		fmt.Printf("p2pmobile: [dial] relay failed to %s via %s: %v\n", pidShort, bp.ID, err)
 	}
 	return fmt.Errorf("unreachable: %s", pid)
+}
+
+// peerHasReachableDirectAddrs returns true if the peer has at least one
+// non-relay address in an IP family we can reach from our local addrs.
+func (n *Node) peerHasReachableDirectAddrs(pid peer.ID) bool {
+	n.mu.RLock()
+	h := n.host
+	n.mu.RUnlock()
+	if h == nil {
+		return false
+	}
+
+	// Determine local IP family capabilities
+	hasLocalIPv4, hasLocalIPv6 := false, false
+	for _, la := range h.Addrs() {
+		laStr := la.String()
+		if strings.Contains(laStr, "p2p-circuit") {
+			continue
+		}
+		if strings.Contains(laStr, "/ip4/") {
+			ip := extractIPFromMultiaddr(laStr)
+			if ip != "127.0.0.1" && ip != "0.0.0.0" {
+				hasLocalIPv4 = true
+			}
+		}
+		if strings.Contains(laStr, "/ip6/") {
+			ip := extractIPFromMultiaddr(laStr)
+			if ip != "::1" && ip != "::" {
+				hasLocalIPv6 = true
+			}
+		}
+	}
+
+	for _, a := range h.Peerstore().Addrs(pid) {
+		aStr := a.String()
+		if strings.Contains(aStr, "p2p-circuit") {
+			continue
+		}
+		// Skip unroutable addresses
+		ip := extractIPFromMultiaddr(aStr)
+		if ip == "127.0.0.1" || ip == "::1" || ip == "0.0.0.0" || ip == "::" || ip == "" {
+			continue
+		}
+		isV6 := strings.Contains(aStr, "/ip6/")
+		if isV6 && hasLocalIPv6 {
+			return true
+		}
+		if !isV6 && strings.Contains(aStr, "/ip4/") && hasLocalIPv4 {
+			return true
+		}
+	}
+	return false
 }
 
 // aggressiveDirectUpgrade tries to upgrade a relay connection to direct.
@@ -2069,6 +2296,14 @@ func (n *Node) aggressiveDirectUpgrade(pid peer.ID) {
 	// Wait briefly for identify exchange to complete on the relay connection.
 	// The remote peer's fresh addresses should arrive via identify within 1-2s.
 	time.Sleep(800 * time.Millisecond)
+
+	// Pre-check: if the peer has NO reachable direct addrs (e.g. IPv6-only peer
+	// vs our IPv4-only device), skip the upgrade loop entirely. Relay is the
+	// only viable path and repeated upgrade attempts just destabilize it.
+	if !n.peerHasReachableDirectAddrs(pid) {
+		fmt.Printf("p2pmobile: [upgrade] no reachable direct addrs for %s — staying on relay\n", pidShort)
+		return
+	}
 
 	for attempt := 1; attempt <= 4; attempt++ {
 		n.mu.RLock()
@@ -2089,7 +2324,7 @@ func (n *Node) aggressiveDirectUpgrade(pid peer.ID) {
 		}
 
 		fmt.Printf("p2pmobile: [upgrade] attempt %d/4 direct dial for %s\n", attempt, pidShort)
-		if n.tryDialPeerDirect(pid) {
+		if n.tryDialPeerDirect(pid, nil) {
 			actual := actualConnTransport(h, pid)
 			fmt.Printf("p2pmobile: [upgrade] ✓ DIRECT punched for %s (attempt %d) transport=%s\n", pidShort, attempt, actual)
 			// Close relay connections now that we have direct
@@ -2122,13 +2357,32 @@ func (n *Node) dialPeer(pid peer.ID) error {
 	if h.Network().Connectedness(pid) == network.Connected && n.hasDirectConnToPeer(pid) {
 		return nil
 	}
+
+	// Do DHT lookup ONCE before the pass loop — avoids 5s DHT timeout per pass.
+	var dhtAddrs []multiaddr.Multiaddr
+	n.mu.RLock()
+	d := n.dht
+	n.mu.RUnlock()
+	if d != nil {
+		ctx, cancel := context.WithTimeout(n.ctx, 5*time.Second)
+		peerInfo, err := d.FindPeer(ctx, pid)
+		cancel()
+		if err == nil {
+			dhtAddrs = peerInfo.Addrs
+			fmt.Printf("p2pmobile: [dial] DHT found %d addrs for %s\n", len(dhtAddrs), pidShort)
+		} else {
+			dhtAddrs = []multiaddr.Multiaddr{} // empty but non-nil = "DHT done"
+			fmt.Printf("p2pmobile: [dial] DHT FindPeer failed for %s: %v\n", pidShort, err)
+		}
+	}
+
 	for pass := 0; pass < directDialPasses; pass++ {
 		if pass > 0 {
 			j := 80 + rand.Intn(220)
 			time.Sleep(time.Duration(j) * time.Millisecond)
 			fmt.Printf("p2pmobile: [dial] direct pass %d/%d jitter=%dms peer=%s\n", pass+1, directDialPasses, j, pidShort)
 		}
-		if n.tryDialPeerDirect(pid) {
+		if n.tryDialPeerDirect(pid, dhtAddrs) {
 			fmt.Printf("p2pmobile: [dial] direct OK (pass %d) peer=%s\n", pass+1, pidShort)
 			return nil
 		}
